@@ -141,6 +141,7 @@ async def iniciar_navegador() -> Any:
             "headless": settings.chrome_headless,
             "user_data_dir": settings.chrome_profile_dir,
             "browser_args": browser_args,
+            "no_sandbox": True,
         }
         if executable_path:
             kwargs["browser_executable_path"] = executable_path

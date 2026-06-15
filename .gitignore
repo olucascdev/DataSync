@@ -60,6 +60,7 @@ Thumbs.db
 downloads/
 logs/
 data/chrome-profile/
+estoque_sync/data/
 
 # Database files
 *.db

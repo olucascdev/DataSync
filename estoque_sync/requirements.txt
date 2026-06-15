@@ -1,0 +1,9 @@
+nodriver
+camelot-py[cv]
+psycopg[binary,pool]
+pandas
+APScheduler
+structlog
+pydantic-settings
+python-dotenv
+httpx

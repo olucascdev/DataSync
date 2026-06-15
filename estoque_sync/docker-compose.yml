@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: estoque-sync-postgres
+    environment:
+      POSTGRES_DB: carla_db
+      POSTGRES_USER: carla
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-senha_segura_aqui}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U carla -d carla_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  estoque-sync:
+    build: .
+    container_name: estoque-sync-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: carla_db
+      POSTGRES_USER: carla
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-senha_segura_aqui}
+      OBJETIVA_URL: ${OBJETIVA_URL:-https://carlabaleeiro.objetivaweb.app.br}
+      OBJETIVA_USERNAME: ${OBJETIVA_USERNAME:-}
+      OBJETIVA_PASSWORD: ${OBJETIVA_PASSWORD:-}
+      CHROME_HEADLESS: ${CHROME_HEADLESS:-true}
+      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-60}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DOWNLOAD_DIR: /app/downloads
+      BROWSER_EXECUTABLE_PATH: ${BROWSER_EXECUTABLE_PATH:-}
+    volumes:
+      - ./data/chrome-profile:/app/data/chrome-profile
+      - ./downloads:/app/downloads
+      - ./logs:/app/logs
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

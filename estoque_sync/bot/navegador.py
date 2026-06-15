@@ -63,6 +63,26 @@ def _configurar_preferencias_download() -> None:
         logger.warning("falha_ao_configurar_preferencias_download", error=str(exc))
 
 
+def _limpar_locks_perfil() -> None:
+    """Remove arquivos de lock do Singleton do Chrome no perfil persistente.
+
+    Quando o container reinicia com o Chrome ainda "rodando", sobram
+    SingletonLock/SingletonSocket/SingletonCookie no user_data_dir, e o
+    novo Chrome falha com "Failed to connect to browser". Limpar antes
+    de iniciar resolve o crash em restart.
+    """
+    profile_dir = Path(settings.chrome_profile_dir)
+    locks = ["SingletonLock", "SingletonSocket", "SingletonCookie"]
+    for nome in locks:
+        lock_path = profile_dir / nome
+        try:
+            if lock_path.exists() or lock_path.is_symlink():
+                lock_path.unlink()
+                logger.info("lock_perfil_removido", arquivo=str(lock_path))
+        except Exception as exc:
+            logger.warning("falha_ao_remover_lock_perfil", arquivo=str(lock_path), error=str(exc))
+
+
 def _detectar_navegador() -> Optional[str]:
     """Detecta o caminho do executável do navegador.
 
@@ -134,6 +154,7 @@ async def iniciar_navegador() -> Any:
 
     # Detectar executável do navegador
     executable_path = _detectar_navegador()
+    _limpar_locks_perfil()
     _configurar_preferencias_download()
 
     try:

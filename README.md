@@ -1,6 +1,6 @@
 # estoque_sync
 
-Serviço de sincronização automática de estoque para a **Carla Baleeiro**. Faz scraping do relatório de estoque no ERP Objetiva Web, extrai os dados do PDF gerado e realiza upsert no banco de dados PostgreSQL.
+Serviço de sincronização automática de estoque para a **Cliente**. Faz scraping do relatório de estoque no ERP Objetiva Web, extrai os dados do PDF gerado e realiza upsert no banco de dados PostgreSQL.
 
 ---
 
@@ -32,7 +32,7 @@ Objetiva Web (ERP)
        │  Staging table → CTE UPDATE + INSERT
        │  Chave de upsert: descrição do produto
        ▼
-   carla_produtos (tabela atualizada)
+   cliente_produtos (tabela atualizada)
 ```
 
 ---

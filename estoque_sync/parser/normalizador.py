@@ -74,6 +74,14 @@ def normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
     antes = len(df_norm)
     df_norm = df_norm.dropna(subset=["valor", "quantidade"])
     df_norm = df_norm[df_norm["valor"].str.strip().ne("") & df_norm["quantidade"].str.strip().ne("")]
+
+    # Descartar linhas onde valor/quantidade não são decimais válidos.
+    # Captura cabeçalhos de página que vazam para os dados (ex: "QUANTIDADE",
+    # "VALOR") sem precisar manter uma blacklist de palavras.
+    valido = df_norm["valor"].apply(lambda v: _parse_decimal_brasileiro(v) is not None) & \
+             df_norm["quantidade"].apply(lambda v: _parse_decimal_brasileiro(v) is not None)
+    df_norm = df_norm[valido]
+
     descartados = antes - len(df_norm)
     if descartados:
         logger.warning("linhas_sem_valor_descartadas", total=descartados)

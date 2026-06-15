@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: estoque-sync-postgres
+    env_file: estoque_sync/.env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-carla_db}
+      POSTGRES_USER: ${POSTGRES_USER:-carla}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-carla} -d ${POSTGRES_DB:-carla_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  estoque-sync:
+    build: estoque_sync/
+    container_name: estoque-sync-app
+    env_file: estoque_sync/.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+    volumes:
+      - chrome_profile:/app/data/chrome-profile
+      - downloads:/app/downloads
+      - logs:/app/logs
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+    restart: unless-stopped
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: estoque-sync-pgadmin
+    env_file: estoque_sync/.env
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@admin.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+    ports:
+      - "8080:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  chrome_profile:
+  downloads:
+  logs:
+  pgadmin_data:

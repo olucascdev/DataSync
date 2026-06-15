@@ -49,37 +49,55 @@ async def verificar_ou_logar(browser: Any, page: Any) -> Any:
             logger.warning("sem_credenciais_configuradas")
             return page
 
+        # DIAGNÓSTICO: estrutura da página de login antes de submeter
+        diag = await _js(page, """
+            const senha = document.getElementById('Senha') || document.querySelector('input[name="Senha"]') || document.querySelector('input[type="password"]');
+            const form = senha ? senha.closest('form') : document.querySelector('form');
+            const inputs = form ? Array.from(form.querySelectorAll('input')).map(i => ({ name: i.name, type: i.type, id: i.id })) : [];
+            const token = form ? form.querySelector('input[name="__RequestVerificationToken"]') : null;
+            const btn = form ? form.querySelector('button[type="submit"], input[type="submit"], button') : null;
+            return {
+                totalForms: document.forms.length,
+                formAction: form ? form.getAttribute('action') : null,
+                formMethod: form ? form.getAttribute('method') : null,
+                temAntiForgeryToken: !!token,
+                inputs: inputs,
+                botaoTexto: btn ? (btn.textContent || btn.value || '').trim() : null,
+            };
+        """)
+        logger.info("diagnostico_form_login", diag=diag)
+
         logger.info("realizando_login_automatico")
 
-        # Preencher e submeter via JS — evita problemas de foco/eventos em headless
+        # Preencher campos e clicar no botão real (dispara handlers do framework)
         resultado = await _js(page, f"""
             const usuario = document.getElementById('Login') || document.querySelector('input[name="Login"]');
             const senha = document.getElementById('Senha') || document.querySelector('input[name="Senha"]') || document.querySelector('input[type="password"]');
-            const form = document.querySelector('form');
-
             if (!usuario || !senha) return {{ ok: false, motivo: 'campos_nao_encontrados' }};
 
-            // Preencher valores via property setter (dispara validação do framework)
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            nativeInputValueSetter.call(usuario, {json.dumps(settings.objetiva_username)});
+            const form = senha.closest('form') || document.querySelector('form');
+
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            setter.call(usuario, {json.dumps(settings.objetiva_username)});
             usuario.dispatchEvent(new Event('input', {{ bubbles: true }}));
             usuario.dispatchEvent(new Event('change', {{ bubbles: true }}));
-
-            nativeInputValueSetter.call(senha, {json.dumps(settings.objetiva_password)});
+            setter.call(senha, {json.dumps(settings.objetiva_password)});
             senha.dispatchEvent(new Event('input', {{ bubbles: true }}));
             senha.dispatchEvent(new Event('change', {{ bubbles: true }}));
 
-            if (form) {{
-                form.submit();
-                return {{ ok: true, metodo: 'form_submit' }};
-            }}
+            // Confirmar que os valores foram aplicados
+            const preenchido = usuario.value.length > 0 && senha.value.length > 0;
 
-            const btn = document.querySelector('button[type="submit"]') || document.querySelector('input[type="submit"]');
+            // Preferir clicar no botão (dispara onsubmit/AJAX/anti-forgery handlers)
+            const btn = form ? form.querySelector('button[type="submit"], input[type="submit"], button') : null;
             if (btn) {{
                 btn.click();
-                return {{ ok: true, metodo: 'button_click' }};
+                return {{ ok: true, metodo: 'button_click', preenchido: preenchido }};
             }}
-
+            if (form) {{
+                form.submit();
+                return {{ ok: true, metodo: 'form_submit', preenchido: preenchido }};
+            }}
             return {{ ok: false, motivo: 'form_e_botao_nao_encontrados' }};
         """)
 
@@ -89,11 +107,24 @@ async def verificar_ou_logar(browser: Any, page: Any) -> Any:
         for _ in range(15):
             await page.sleep(2)
             url_atual = page.url or ""
-            if "Account/Entrar" not in url_atual and "login" not in url_atual.lower():
+            if url_atual and "Account/Entrar" not in url_atual and "login" not in url_atual.lower():
                 logger.info("redirect_pos_login_detectado", url=url_atual)
                 return page
 
-        logger.warning("timeout_aguardando_redirect_pos_login", url=page.url)
+        # DIAGNÓSTICO: login falhou — capturar mensagens de erro/validação da página
+        erro_pagina = await _js(page, """
+            const sel = ['.validation-summary-errors', '.field-validation-error', '.text-danger',
+                         '.alert', '.alert-danger', '[role="alert"]', '.toast-message'];
+            const msgs = [];
+            for (const s of sel) {
+                document.querySelectorAll(s).forEach(el => {
+                    const t = (el.textContent || '').trim();
+                    if (t) msgs.push(t);
+                });
+            }
+            return { url: location.href, titulo: document.title, mensagens: msgs.slice(0, 10) };
+        """)
+        logger.warning("login_falhou_diagnostico", erro_pagina=erro_pagina)
         return page
 
     except Exception as exc:

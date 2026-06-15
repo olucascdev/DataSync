@@ -133,8 +133,16 @@ async def verificar_ou_logar(browser: Any, page: Any) -> Any:
                     await botao_login.click()
                     logger.info("login_automatico_realizado_aguardando_redirecionamento")
 
-                    # Aguardar redirecionamento
-                    await page.sleep(5)
+                    # Aguardar redirect: verifica a cada 2s se saiu da página de login (até 30s)
+                    for _ in range(15):
+                        await page.sleep(2)
+                        url_atual = page.url or ""
+                        if "Account/Entrar" not in url_atual and "login" not in url_atual.lower():
+                            logger.info("redirect_pos_login_detectado", url=url_atual)
+                            break
+                    else:
+                        logger.warning("timeout_aguardando_redirect_pos_login", url=page.url)
+
                     return page
                 else:
                     logger.warning("botao_de_login_nao_encontrado")

@@ -165,12 +165,12 @@ async def _sincronizar_estoque_impl() -> None:
         )
 
         status = "success"
-        detalhes = f"Sync concluído em {(datetime.now() - sync_start).total_seconds():.1f}s"
+        detalhes = {"msg": f"Sync concluído em {(datetime.now() - sync_start).total_seconds():.1f}s"}
 
     except Exception as exc:
         logger.error("sync_error", error=str(exc), exc_info=True)
         status = "error"
-        detalhes = f"Erro: {str(exc)}"
+        detalhes = {"erro": str(exc)}
 
     finally:
         # -------------------------------------------------------

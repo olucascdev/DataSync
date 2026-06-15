@@ -1,5 +1,6 @@
 """Configuração de logging com structlog e JSON."""
 
+import json
 import logging
 import sys
 from typing import Any
@@ -56,7 +57,7 @@ def log_sync_to_db(
     total_recebidos: int,
     total_atualizados: int,
     total_criados: int,
-    detalhes: str = "",
+    detalhes: dict | str = "",
 ) -> None:
     """Registra um log de sincronização na tabela carla_sync_logs.
 
@@ -69,6 +70,13 @@ def log_sync_to_db(
         total_criados: Total de registros inseridos no UPSERT.
         detalhes: Detalhes adicionais em JSON ou texto livre.
     """
+    if isinstance(detalhes, dict):
+        detalhes_json = json.dumps(detalhes, ensure_ascii=False)
+    elif detalhes:
+        detalhes_json = json.dumps({"msg": detalhes}, ensure_ascii=False)
+    else:
+        detalhes_json = "{}"
+
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -77,7 +85,7 @@ def log_sync_to_db(
                     (origem, status, total_recebidos, total_atualizados, total_criados, detalhes, started_at, finished_at)
                 VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
                 """,
-                (origem, status, total_recebidos, total_atualizados, total_criados, detalhes),
+                (origem, status, total_recebidos, total_atualizados, total_criados, detalhes_json),
             )
         # O commit/rollback é gerenciado pelo context manager que fornece a conexão
     except Exception as exc:

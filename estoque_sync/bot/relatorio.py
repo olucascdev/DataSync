@@ -161,12 +161,29 @@ async def _abrir_pagina_relatorio(browser: Any) -> Any:
 
     for tentativa in range(1, 4):
         page = await browser.get(RELATORIO_URL)
-        await page.sleep(tentativa)
+        # Espera progressiva: dá tempo ao redirect pós-login (mais lento em headless/VPS)
+        await page.sleep(2 + tentativa)
 
         try:
+            url_atual = page.url
+            titulo = await _js(page, "return document.title")
+            logger.info(
+                "aguardando_form_relatorio",
+                tentativa=tentativa,
+                url=url_atual,
+                titulo=titulo,
+            )
+
             form = await asyncio.wait_for(page.select("#form-relatorio"), timeout=30.0)
             if form:
                 return page
+
+            logger.warning(
+                "form_relatorio_nao_encontrado_na_pagina",
+                tentativa=tentativa,
+                url=url_atual,
+                titulo=titulo,
+            )
         except Exception as exc:
             ultimo_erro = exc
             logger.warning(

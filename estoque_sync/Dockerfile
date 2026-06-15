@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libxss1 libxtst6 xdg-utils \
     libgl1 libglib2.0-0 \
     ghostscript \
+    xvfb \
     && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
        | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] \
@@ -31,4 +32,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "main.py"]
+# Roda sob display virtual (Xvfb) para que o Chrome opere em modo
+# não-headless. Necessário porque o Cloudflare Turnstile (captcha) na
+# tela de login bloqueia navegadores headless.
+CMD ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24", "python", "main.py"]

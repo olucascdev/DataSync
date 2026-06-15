@@ -5,6 +5,7 @@ NUNCA desloga entre execuções para manter a sessão ASP.NET.
 """
 
 import asyncio
+import json
 from typing import Any
 
 from config.settings import settings
@@ -13,154 +14,88 @@ from app.logging_config import get_logger
 logger = get_logger("bot.login")
 
 
+async def _js(page: Any, script: str) -> Any:
+    """Executa JS e retorna resultado via JSON.stringify para evitar RemoteObject."""
+    wrapped = f"(() => {{ const __r = (() => {{ {script} }})(); return JSON.stringify(__r); }})()"
+    raw = await page.evaluate(wrapped)
+    if isinstance(raw, str):
+        return json.loads(raw)
+    return raw
+
+
 async def verificar_ou_logar(browser: Any, page: Any) -> Any:
-    """Verifica se o usuário está logado ou realiza login.
+    """Verifica se o usuário está logado ou realiza login via JavaScript.
 
-    Estratégia:
-    1. Verificar se a página atual contém campos de login
-    2. Se não encontrar campos de login, assume que já está autenticado
-    3. Se encontrar campos de login e houver credenciais no config, preencher
-    4. Se não houver credenciais, aguardar login manual (perfil persistente)
-
-    O perfil persistente do Chrome salva cookies e sessões ASP.NET,
-    então na maioria das vezes o usuário já estará logado.
-
-    Args:
-        browser: Instância do browser nodriver.
-        page: Página atual do nodriver.
-
-    Returns:
-        Página atual (logada).
+    Usa JS direto para preencher e submeter o formulário — mais confiável
+    em modo headless do que send_keys + click via CDP.
     """
     logger.info("verificando_estado_de_login")
 
     try:
-        # Tentar encontrar campos de login
-        # O sistema Objetiva geralmente usa inputs com name ou id relacionados a login
-        campos_login = [
-            'input[id="Login"]',           # ID do Objetiva Web
-            'input[name="Login"]',         # Name do Objetiva Web
-            'input[id="login"]',           # lowercase fallback
-            'input[name="login"]',
-            'input[name="username"]',
-            'input[name="usuario"]',
-            'input[type="email"]',
-            'input[id="username"]',
-        ]
+        # Detectar se está na página de login verificando campos no DOM via JS
+        tem_login = await _js(page, """
+            const u = document.getElementById('Login') || document.querySelector('input[name="Login"]');
+            const s = document.getElementById('Senha') || document.querySelector('input[name="Senha"]') || document.querySelector('input[type="password"]');
+            return !!(u && s);
+        """)
 
-        campo_usuario_encontrado = None
-        for seletor in campos_login:
-            try:
-                campo = await asyncio.wait_for(page.select(seletor), timeout=3.0)
-                if campo:
-                    campo_usuario_encontrado = campo
-                    break
-            except (asyncio.TimeoutError, Exception):
-                continue
-
-        if campo_usuario_encontrado is None:
-            # Não encontrou campos de login - provavelmente já está logado
+        if not tem_login:
             logger.info("usuario_ja_esta_logado_sessao_persistente")
             return page
 
-        # Encontrou campos de login - precisa autenticar
         logger.info("campos_de_login_encontrados_tentando_autenticar")
 
-        if settings.objetiva_username and settings.objetiva_password:
-            # Tem credenciais configuradas - realizar login automático
-            logger.info("realizando_login_automatico")
+        if not (settings.objetiva_username and settings.objetiva_password):
+            logger.warning("sem_credenciais_configuradas")
+            return page
 
-            # Preencher usuário
-            await campo_usuario_encontrado.click()
-            await campo_usuario_encontrado.send_keys(settings.objetiva_username)
+        logger.info("realizando_login_automatico")
 
-            # Encontrar e preencher senha
-            campos_senha = [
-                'input[id="Senha"]',           # ID do Objetiva Web
-                'input[name="Senha"]',         # Name do Objetiva Web
-                'input[name="password"]',
-                'input[name="senha"]',
-                'input[type="password"]',
-                'input[id="password"]',
-                'input[id="senha"]',
-            ]
+        # Preencher e submeter via JS — evita problemas de foco/eventos em headless
+        resultado = await _js(page, f"""
+            const usuario = document.getElementById('Login') || document.querySelector('input[name="Login"]');
+            const senha = document.getElementById('Senha') || document.querySelector('input[name="Senha"]') || document.querySelector('input[type="password"]');
+            const form = document.querySelector('form');
 
-            campo_senha = None
-            for seletor in campos_senha:
-                try:
-                    campo = await asyncio.wait_for(page.select(seletor), timeout=3.0)
-                    if campo:
-                        campo_senha = campo
-                        break
-                except (asyncio.TimeoutError, Exception):
-                    continue
+            if (!usuario || !senha) return {{ ok: false, motivo: 'campos_nao_encontrados' }};
 
-            if campo_senha:
-                await campo_senha.click()
-                await campo_senha.send_keys(settings.objetiva_password)
+            // Preencher valores via property setter (dispara validação do framework)
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            nativeInputValueSetter.call(usuario, {json.dumps(settings.objetiva_username)});
+            usuario.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            usuario.dispatchEvent(new Event('change', {{ bubbles: true }}));
 
-                # Encontrar e clicar no botão de login
-                botoes_login = [
-                    'button[type="submit"]',
-                    'input[type="submit"]',
-                ]
+            nativeInputValueSetter.call(senha, {json.dumps(settings.objetiva_password)});
+            senha.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            senha.dispatchEvent(new Event('change', {{ bubbles: true }}));
 
-                botao_login = None
-                for seletor in botoes_login:
-                    try:
-                        botao = await asyncio.wait_for(page.select(seletor), timeout=3.0)
-                        if botao:
-                            botao_login = botao
-                            break
-                    except (asyncio.TimeoutError, Exception):
-                        continue
+            if (form) {{
+                form.submit();
+                return {{ ok: true, metodo: 'form_submit' }};
+            }}
 
-                # Fallback: iterar todos os botões e verificar texto
-                if botao_login is None:
-                    try:
-                        botoes = await page.select_all("button")
-                        for btn in botoes:
-                            texto = await btn.get_text()
-                            if texto and any(
-                                p in texto.lower() for p in ["entrar", "login", "acessar", "enviar"]
-                            ):
-                                botao_login = btn
-                                break
-                    except Exception:
-                        pass
+            const btn = document.querySelector('button[type="submit"]') || document.querySelector('input[type="submit"]');
+            if (btn) {{
+                btn.click();
+                return {{ ok: true, metodo: 'button_click' }};
+            }}
 
-                if botao_login:
-                    await botao_login.click()
-                    logger.info("login_automatico_realizado_aguardando_redirecionamento")
+            return {{ ok: false, motivo: 'form_e_botao_nao_encontrados' }};
+        """)
 
-                    # Aguardar redirect: verifica a cada 2s se saiu da página de login (até 30s)
-                    for _ in range(15):
-                        await page.sleep(2)
-                        url_atual = page.url or ""
-                        if "Account/Entrar" not in url_atual and "login" not in url_atual.lower():
-                            logger.info("redirect_pos_login_detectado", url=url_atual)
-                            break
-                    else:
-                        logger.warning("timeout_aguardando_redirect_pos_login", url=page.url)
+        logger.info("login_automatico_realizado_aguardando_redirecionamento", resultado=resultado)
 
-                    return page
-                else:
-                    logger.warning("botao_de_login_nao_encontrado")
-            else:
-                logger.warning("campo_de_senha_nao_encontrado")
-        else:
-            # Sem credenciais - aguardar login manual
-            logger.warning(
-                "sem_credenciais_configuradas_aguardando_login_manual_ou_sessao_persistente"
-            )
-            logger.info(
-                "dica_configure_OBJETIVA_USERNAME_e_OBJETIVA_PASSWORD_no_.env_para_login_automatico"
-            )
+        # Aguardar redirect: verifica a cada 2s se saiu da página de login (até 30s)
+        for _ in range(15):
+            await page.sleep(2)
+            url_atual = page.url or ""
+            if "Account/Entrar" not in url_atual and "login" not in url_atual.lower():
+                logger.info("redirect_pos_login_detectado", url=url_atual)
+                return page
 
-        # Retornar a página atual (pode estar logada ou não)
+        logger.warning("timeout_aguardando_redirect_pos_login", url=page.url)
         return page
 
     except Exception as exc:
         logger.error("erro_ao_verificar_ou_logar", error=str(exc))
-        # Retornar a página mesmo em caso de erro
         return page

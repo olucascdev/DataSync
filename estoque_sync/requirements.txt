@@ -7,3 +7,4 @@ structlog
 pydantic-settings
 python-dotenv
 httpx
+pyvirtualdisplay

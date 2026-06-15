@@ -32,7 +32,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Roda sob display virtual (Xvfb) para que o Chrome opere em modo
-# não-headless. Necessário porque o Cloudflare Turnstile (captcha) na
-# tela de login bloqueia navegadores headless.
-CMD ["xvfb-run", "-a", "--server-args=-screen 0 1920x1080x24", "python", "main.py"]
+CMD ["python", "main.py"]

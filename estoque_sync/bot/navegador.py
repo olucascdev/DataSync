@@ -7,6 +7,7 @@ que não requer chromedriver separado.
 import os
 import json
 import shutil
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
@@ -16,6 +17,41 @@ from config.settings import settings
 from app.logging_config import get_logger
 
 logger = get_logger("bot.navegador")
+
+# Display virtual (Xvfb) — mantido global para não ser coletado pelo GC
+# enquanto o Chrome roda em modo não-headless dentro do container.
+_virtual_display: Any = None
+
+
+def _iniciar_display_virtual() -> None:
+    """Inicia um display virtual (Xvfb) via pyvirtualdisplay.
+
+    Necessário para rodar o Chrome em modo não-headless dentro do container
+    (sem monitor físico). O modo não-headless é exigido porque o Cloudflare
+    Turnstile na tela de login bloqueia navegadores headless.
+
+    Só inicia no Linux, quando não-headless e sem DISPLAY já configurado.
+    """
+    global _virtual_display
+
+    if settings.chrome_headless:
+        return  # headless não precisa de display
+    if not sys.platform.startswith("linux"):
+        return  # macOS/Windows já têm display nativo
+    if os.environ.get("DISPLAY"):
+        return  # já existe um display configurado
+    if _virtual_display is not None:
+        return  # já iniciado nesta execução
+
+    try:
+        from pyvirtualdisplay import Display
+
+        _virtual_display = Display(visible=False, size=(1920, 1080))
+        _virtual_display.start()
+        logger.info("display_virtual_iniciado", display=os.environ.get("DISPLAY"))
+    except Exception as exc:
+        logger.error("falha_ao_iniciar_display_virtual", error=str(exc))
+        _virtual_display = None
 
 # Caminhos comuns do Brave Browser para auto-detecção
 BRAVE_PATHS = [
@@ -151,6 +187,9 @@ async def iniciar_navegador() -> Any:
     # Adicionar argumentos customizados do settings
     if settings.chrome_args:
         browser_args.extend(settings.chrome_args)
+
+    # Iniciar display virtual (Xvfb) se rodar não-headless no Linux
+    _iniciar_display_virtual()
 
     # Detectar executável do navegador
     executable_path = _detectar_navegador()

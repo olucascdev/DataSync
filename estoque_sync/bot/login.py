@@ -8,6 +8,8 @@ import asyncio
 import json
 from typing import Any
 
+import nodriver as uc
+
 from config.settings import settings
 from app.logging_config import get_logger
 
@@ -21,6 +23,71 @@ async def _js(page: Any, script: str) -> Any:
     if isinstance(raw, str):
         return json.loads(raw)
     return raw
+
+
+async def _clicar_coordenada(page: Any, x: float, y: float) -> None:
+    """Dispara um clique real (mousePressed + mouseReleased) via CDP nas coordenadas."""
+    await page.send(uc.cdp.input_.dispatch_mouse_event(
+        type_="mouseMoved", x=x, y=y,
+    ))
+    await page.sleep(0.1)
+    await page.send(uc.cdp.input_.dispatch_mouse_event(
+        type_="mousePressed", x=x, y=y,
+        button=uc.cdp.input_.MouseButton.LEFT, click_count=1, buttons=1,
+    ))
+    await page.send(uc.cdp.input_.dispatch_mouse_event(
+        type_="mouseReleased", x=x, y=y,
+        button=uc.cdp.input_.MouseButton.LEFT, click_count=1, buttons=1,
+    ))
+
+
+async def _resolver_turnstile(page: Any) -> bool:
+    """Resolve o Cloudflare Turnstile clicando no checkbox do widget via CDP.
+
+    O Turnstile interativo só preenche o input cf-turnstile-response após um
+    clique real no checkbox. Localiza o iframe do widget, calcula a posição do
+    checkbox (lado esquerdo, centralizado verticalmente) e clica. Faz poll do
+    token entre tentativas. Retorna True quando o token é obtido.
+    """
+    for tentativa in range(20):
+        estado = await _js(page, """
+            const inp = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+            if (inp && inp.value && inp.value.length > 0) return { temToken: true };
+
+            // Localizar o widget visível (iframe do Cloudflare ou container .cf-turnstile)
+            let alvo = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            if (!alvo) {
+                const c = document.querySelector('.cf-turnstile');
+                if (c) alvo = c.querySelector('iframe') || c;
+            }
+            if (!alvo && inp) alvo = inp.parentElement;
+            if (!alvo) return { temToken: false, rect: null };
+
+            const r = alvo.getBoundingClientRect();
+            return { temToken: false, rect: { x: r.x, y: r.y, w: r.width, h: r.height } };
+        """)
+
+        if estado.get("temToken"):
+            logger.info("turnstile_token_obtido", tentativa=tentativa)
+            return True
+
+        rect = estado.get("rect")
+        if rect and rect["w"] > 0 and rect["h"] > 0:
+            # Checkbox fica ~30px da borda esquerda, centralizado na vertical
+            click_x = rect["x"] + 30
+            click_y = rect["y"] + rect["h"] / 2
+            logger.info("turnstile_clicando_widget", tentativa=tentativa, x=click_x, y=click_y, rect=rect)
+            try:
+                await _clicar_coordenada(page, click_x, click_y)
+            except Exception as exc:
+                logger.warning("falha_ao_clicar_turnstile", error=str(exc))
+        else:
+            logger.info("turnstile_widget_ainda_nao_renderizado", tentativa=tentativa)
+
+        await page.sleep(2)
+
+    logger.warning("turnstile_token_nao_obtido_apos_tentativas")
+    return False
 
 
 async def verificar_ou_logar(browser: Any, page: Any) -> Any:
@@ -87,25 +154,10 @@ async def verificar_ou_logar(browser: Any, page: Any) -> Any:
         """)
         logger.info("credenciais_preenchidas", preenchido=preenchido)
 
-        # ETAPA 2: aguardar o Cloudflare Turnstile resolver e preencher o token.
-        # O Turnstile gera o token de forma assíncrona; submeter antes disso
-        # resulta em "Captcha inválido!". Poll até 60s pelo token não-vazio.
-        token_obtido = False
-        for tentativa in range(30):
-            estado_token = await _js(page, """
-                const t = document.querySelector('input[name="cf-turnstile-response"]')
-                       || document.querySelector('textarea[name="cf-turnstile-response"]')
-                       || document.querySelector('input[name="g-recaptcha-response"]');
-                return { temToken: !!(t && t.value && t.value.length > 0), tamanho: t ? t.value.length : -1 };
-            """)
-            if estado_token.get("temToken"):
-                token_obtido = True
-                logger.info("turnstile_token_obtido", tentativa=tentativa, tamanho=estado_token.get("tamanho"))
-                break
-            await page.sleep(2)
-
-        if not token_obtido:
-            logger.warning("turnstile_token_nao_obtido_submetendo_mesmo_assim")
+        # ETAPA 2: resolver o Cloudflare Turnstile clicando no widget via CDP.
+        # O Turnstile interativo só preenche o token após um clique real no
+        # checkbox; submeter antes resulta em "Captcha inválido!".
+        token_obtido = await _resolver_turnstile(page)
 
         # ETAPA 3: clicar no botão para submeter (com o token já preenchido)
         resultado = await _js(page, """

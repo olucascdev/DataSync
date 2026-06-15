@@ -1,4 +1,4 @@
-# estoque_sync
+# DataSync
 
 Serviço de sincronização automática de estoque para a **Cliente**. Faz scraping do relatório de estoque no ERP Objetiva Web, extrai os dados do PDF gerado e realiza upsert no banco de dados PostgreSQL.
 

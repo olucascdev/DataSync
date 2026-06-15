@@ -69,13 +69,11 @@ async def verificar_ou_logar(browser: Any, page: Any) -> Any:
 
         logger.info("realizando_login_automatico")
 
-        # Preencher campos e clicar no botão real (dispara handlers do framework)
-        resultado = await _js(page, f"""
+        # ETAPA 1: preencher as credenciais (SEM submeter ainda)
+        preenchido = await _js(page, f"""
             const usuario = document.getElementById('Login') || document.querySelector('input[name="Login"]');
             const senha = document.getElementById('Senha') || document.querySelector('input[name="Senha"]') || document.querySelector('input[type="password"]');
             if (!usuario || !senha) return {{ ok: false, motivo: 'campos_nao_encontrados' }};
-
-            const form = senha.closest('form') || document.querySelector('form');
 
             const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
             setter.call(usuario, {json.dumps(settings.objetiva_username)});
@@ -85,23 +83,41 @@ async def verificar_ou_logar(browser: Any, page: Any) -> Any:
             senha.dispatchEvent(new Event('input', {{ bubbles: true }}));
             senha.dispatchEvent(new Event('change', {{ bubbles: true }}));
 
-            // Confirmar que os valores foram aplicados
-            const preenchido = usuario.value.length > 0 && senha.value.length > 0;
+            return {{ ok: usuario.value.length > 0 && senha.value.length > 0 }};
+        """)
+        logger.info("credenciais_preenchidas", preenchido=preenchido)
 
-            // Preferir clicar no botão (dispara onsubmit/AJAX/anti-forgery handlers)
+        # ETAPA 2: aguardar o Cloudflare Turnstile resolver e preencher o token.
+        # O Turnstile gera o token de forma assíncrona; submeter antes disso
+        # resulta em "Captcha inválido!". Poll até 60s pelo token não-vazio.
+        token_obtido = False
+        for tentativa in range(30):
+            estado_token = await _js(page, """
+                const t = document.querySelector('input[name="cf-turnstile-response"]')
+                       || document.querySelector('textarea[name="cf-turnstile-response"]')
+                       || document.querySelector('input[name="g-recaptcha-response"]');
+                return { temToken: !!(t && t.value && t.value.length > 0), tamanho: t ? t.value.length : -1 };
+            """)
+            if estado_token.get("temToken"):
+                token_obtido = True
+                logger.info("turnstile_token_obtido", tentativa=tentativa, tamanho=estado_token.get("tamanho"))
+                break
+            await page.sleep(2)
+
+        if not token_obtido:
+            logger.warning("turnstile_token_nao_obtido_submetendo_mesmo_assim")
+
+        # ETAPA 3: clicar no botão para submeter (com o token já preenchido)
+        resultado = await _js(page, """
+            const senha = document.getElementById('Senha') || document.querySelector('input[name="Senha"]') || document.querySelector('input[type="password"]');
+            const form = senha ? (senha.closest('form') || document.querySelector('form')) : document.querySelector('form');
             const btn = form ? form.querySelector('button[type="submit"], input[type="submit"], button') : null;
-            if (btn) {{
-                btn.click();
-                return {{ ok: true, metodo: 'button_click', preenchido: preenchido }};
-            }}
-            if (form) {{
-                form.submit();
-                return {{ ok: true, metodo: 'form_submit', preenchido: preenchido }};
-            }}
-            return {{ ok: false, motivo: 'form_e_botao_nao_encontrados' }};
+            if (btn) { btn.click(); return { ok: true, metodo: 'button_click' }; }
+            if (form) { form.submit(); return { ok: true, metodo: 'form_submit' }; }
+            return { ok: false, motivo: 'form_e_botao_nao_encontrados' };
         """)
 
-        logger.info("login_automatico_realizado_aguardando_redirecionamento", resultado=resultado)
+        logger.info("login_submetido_aguardando_redirecionamento", resultado=resultado, token_obtido=token_obtido)
 
         # Aguardar redirect: verifica a cada 2s se saiu da página de login (até 30s)
         for _ in range(15):

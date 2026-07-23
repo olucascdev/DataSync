@@ -6,6 +6,9 @@ NUNCA desloga entre execuções para manter a sessão ASP.NET.
 
 import asyncio
 import json
+from datetime import datetime, timezone
+from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import nodriver as uc
@@ -14,6 +17,18 @@ from config.settings import settings
 from app.logging_config import get_logger
 
 logger = get_logger("bot.login")
+
+
+class LoginError(RuntimeError):
+    """Erro controlado durante a autenticação no Objetiva Web."""
+
+
+class TurnstileTokenError(LoginError):
+    """O Cloudflare Turnstile não forneceu um token válido."""
+
+
+class LoginRejectedError(LoginError):
+    """O formulário foi enviado, mas o sistema não autenticou a sessão."""
 
 
 async def _js(page: Any, script: str) -> Any:
@@ -49,7 +64,15 @@ async def _resolver_turnstile(page: Any) -> bool:
     checkbox (lado esquerdo, centralizado verticalmente) e clica. Faz poll do
     token entre tentativas. Retorna True quando o token é obtido.
     """
-    for tentativa in range(20):
+    inicio = monotonic()
+    logger.info(
+        "turnstile_verificacao_iniciada",
+        max_tentativas=settings.turnstile_max_attempts,
+        intervalo_segundos=settings.turnstile_retry_seconds,
+    )
+
+    for tentativa in range(settings.turnstile_max_attempts):
+        numero_tentativa = tentativa + 1
         estado = await _js(page, """
             const inp = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
             if (inp && inp.value && inp.value.length > 0) return { temToken: true };
@@ -68,7 +91,11 @@ async def _resolver_turnstile(page: Any) -> bool:
         """)
 
         if estado.get("temToken"):
-            logger.info("turnstile_token_obtido", tentativa=tentativa)
+            logger.info(
+                "turnstile_token_obtido",
+                tentativa=numero_tentativa,
+                duracao_segundos=round(monotonic() - inicio, 1),
+            )
             return True
 
         rect = estado.get("rect")
@@ -76,18 +103,151 @@ async def _resolver_turnstile(page: Any) -> bool:
             # Checkbox fica ~30px da borda esquerda, centralizado na vertical
             click_x = rect["x"] + 30
             click_y = rect["y"] + rect["h"] / 2
-            logger.info("turnstile_clicando_widget", tentativa=tentativa, x=click_x, y=click_y, rect=rect)
+            logger.debug(
+                "turnstile_clicando_widget",
+                tentativa=numero_tentativa,
+                x=click_x,
+                y=click_y,
+                rect=rect,
+            )
             try:
                 await _clicar_coordenada(page, click_x, click_y)
             except Exception as exc:
-                logger.warning("falha_ao_clicar_turnstile", error=str(exc))
-        else:
-            logger.info("turnstile_widget_ainda_nao_renderizado", tentativa=tentativa)
+                logger.warning(
+                    "falha_ao_clicar_turnstile",
+                    tentativa=numero_tentativa,
+                    error=str(exc),
+                )
 
-        await page.sleep(2)
+        if numero_tentativa == 1 or numero_tentativa % 5 == 0:
+            logger.info(
+                "turnstile_aguardando_token",
+                tentativa=numero_tentativa,
+                max_tentativas=settings.turnstile_max_attempts,
+                widget_visivel=bool(rect),
+            )
 
-    logger.warning("turnstile_token_nao_obtido_apos_tentativas")
+        await page.sleep(settings.turnstile_retry_seconds)
+
+    logger.warning(
+        "turnstile_token_nao_obtido",
+        tentativas=settings.turnstile_max_attempts,
+        duracao_segundos=round(monotonic() - inicio, 1),
+    )
     return False
+
+
+async def _salvar_diagnostico_login(page: Any, motivo: str) -> dict[str, Any]:
+    """Salva evidências da tela sem persistir credenciais ou tokens."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    diretorio = Path(settings.login_diagnostics_dir)
+    prefixo = diretorio / f"login_{motivo}_{timestamp}"
+    resultado: dict[str, Any] = {
+        "motivo": motivo,
+        "timestamp": timestamp,
+        "screenshot": None,
+        "html": None,
+        "metadata": None,
+        "erros": [],
+    }
+
+    try:
+        diretorio.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.warning("falha_ao_criar_diretorio_diagnostico_login", error=str(exc))
+        resultado["erros"].append(f"diretorio: {exc}")
+        return resultado
+
+    try:
+        metadata = await _js(page, """
+            const seletores = [
+                '.validation-summary-errors', '.field-validation-error',
+                '.text-danger', '.alert', '.alert-danger',
+                '[role="alert"]', '.toast-message'
+            ];
+            const mensagens = [];
+            for (const seletor of seletores) {
+                document.querySelectorAll(seletor).forEach((el) => {
+                    const texto = (el.textContent || '').trim();
+                    if (texto) mensagens.push(texto);
+                });
+            }
+            const token = document.querySelector(
+                'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+            );
+            return {
+                url: location.href,
+                titulo: document.title,
+                readyState: document.readyState,
+                mensagens: [...new Set(mensagens)].slice(0, 10),
+                temCamposLogin: !!(
+                    document.querySelector('input[name="Login"]')
+                    && document.querySelector('input[type="password"]')
+                ),
+                tamanhoTokenTurnstile: token && token.value ? token.value.length : 0,
+            };
+        """)
+        metadata_path = prefixo.with_suffix(".json")
+        metadata_path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        resultado["metadata"] = str(metadata_path)
+    except Exception as exc:
+        resultado["erros"].append(f"metadata: {exc}")
+
+    try:
+        await _js(page, """
+            document.querySelectorAll(
+                'input[type="password"], input[name="Login"], '
+                + 'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], '
+                + 'input[name="g-recaptcha-response"], textarea[name="g-recaptcha-response"], '
+                + 'input[name="__RequestVerificationToken"]'
+            ).forEach((el) => {
+                el.value = '';
+                el.removeAttribute('value');
+                el.textContent = '';
+                el.setAttribute('data-redacted', 'true');
+            });
+            return true;
+        """)
+    except Exception as exc:
+        resultado["erros"].append(f"sanitizacao: {exc}")
+
+    try:
+        screenshot_path = prefixo.with_suffix(".png")
+        await page.save_screenshot(
+            filename=str(screenshot_path),
+            format="png",
+            full_page=True,
+        )
+        resultado["screenshot"] = str(screenshot_path)
+    except Exception as exc:
+        resultado["erros"].append(f"screenshot: {exc}")
+
+    try:
+        html_sanitizado = await _js(page, """
+            const raiz = document.documentElement.cloneNode(true);
+            raiz.querySelectorAll(
+                'input[type="password"], input[name="Login"], '
+                + 'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], '
+                + 'input[name="g-recaptcha-response"], textarea[name="g-recaptcha-response"], '
+                + 'input[name="__RequestVerificationToken"]'
+            ).forEach((el) => {
+                el.removeAttribute('value');
+                el.textContent = '';
+                el.setAttribute('data-redacted', 'true');
+            });
+            return '<!DOCTYPE html>\\n' + raiz.outerHTML;
+        """)
+        html_path = prefixo.with_suffix(".html")
+        html_path.write_text(html_sanitizado or "", encoding="utf-8")
+        resultado["html"] = str(html_path)
+    except Exception as exc:
+        resultado["erros"].append(f"html: {exc}")
+
+    logger.warning("diagnostico_login_salvo", **resultado)
+    return resultado
 
 
 async def verificar_ou_logar(browser: Any, page: Any) -> Any:
@@ -113,8 +273,7 @@ async def verificar_ou_logar(browser: Any, page: Any) -> Any:
         logger.info("campos_de_login_encontrados_tentando_autenticar")
 
         if not (settings.objetiva_username and settings.objetiva_password):
-            logger.warning("sem_credenciais_configuradas")
-            return page
+            raise LoginError("Credenciais do Objetiva Web não configuradas")
 
         # DIAGNÓSTICO: estrutura da página de login antes de submeter
         diag = await _js(page, """
@@ -132,7 +291,7 @@ async def verificar_ou_logar(browser: Any, page: Any) -> Any:
                 botaoTexto: btn ? (btn.textContent || btn.value || '').trim() : null,
             };
         """)
-        logger.info("diagnostico_form_login", diag=diag)
+        logger.debug("diagnostico_form_login", diag=diag)
 
         logger.info("realizando_login_automatico")
 
@@ -153,11 +312,21 @@ async def verificar_ou_logar(browser: Any, page: Any) -> Any:
             return {{ ok: usuario.value.length > 0 && senha.value.length > 0 }};
         """)
         logger.info("credenciais_preenchidas", preenchido=preenchido)
+        if not preenchido.get("ok"):
+            await _salvar_diagnostico_login(page, "campos_nao_preenchidos")
+            raise LoginError(
+                f"Não foi possível preencher as credenciais: {preenchido.get('motivo')}"
+            )
 
         # ETAPA 2: resolver o Cloudflare Turnstile clicando no widget via CDP.
         # O Turnstile interativo só preenche o token após um clique real no
         # checkbox; submeter antes resulta em "Captcha inválido!".
         token_obtido = await _resolver_turnstile(page)
+        if not token_obtido:
+            await _salvar_diagnostico_login(page, "turnstile_sem_token")
+            raise TurnstileTokenError(
+                "Turnstile não gerou token; formulário de login não foi enviado"
+            )
 
         # ETAPA 3: clicar no botão para submeter (com o token já preenchido)
         resultado = await _js(page, """
@@ -170,31 +339,43 @@ async def verificar_ou_logar(browser: Any, page: Any) -> Any:
         """)
 
         logger.info("login_submetido_aguardando_redirecionamento", resultado=resultado, token_obtido=token_obtido)
+        if not resultado.get("ok"):
+            await _salvar_diagnostico_login(page, "formulario_nao_submetido")
+            raise LoginError(
+                f"Não foi possível submeter o formulário: {resultado.get('motivo')}"
+            )
 
         # Aguardar redirect: verifica a cada 2s se saiu da página de login (até 30s)
-        for _ in range(15):
+        tentativas_redirect = max(1, int(settings.login_redirect_timeout_seconds / 2))
+        for _ in range(tentativas_redirect):
             await page.sleep(2)
             url_atual = page.url or ""
             if url_atual and "Account/Entrar" not in url_atual and "login" not in url_atual.lower():
                 logger.info("redirect_pos_login_detectado", url=url_atual)
                 return page
 
-        # DIAGNÓSTICO: login falhou — capturar mensagens de erro/validação da página
-        erro_pagina = await _js(page, """
-            const sel = ['.validation-summary-errors', '.field-validation-error', '.text-danger',
-                         '.alert', '.alert-danger', '[role="alert"]', '.toast-message'];
-            const msgs = [];
-            for (const s of sel) {
-                document.querySelectorAll(s).forEach(el => {
-                    const t = (el.textContent || '').trim();
-                    if (t) msgs.push(t);
-                });
-            }
-            return { url: location.href, titulo: document.title, mensagens: msgs.slice(0, 10) };
-        """)
-        logger.warning("login_falhou_diagnostico", erro_pagina=erro_pagina)
-        return page
+        diagnostico = await _salvar_diagnostico_login(page, "login_nao_redirecionou")
+        logger.warning(
+            "login_nao_redirecionou",
+            screenshot=diagnostico.get("screenshot"),
+            metadata=diagnostico.get("metadata"),
+            html=diagnostico.get("html"),
+        )
+        raise LoginRejectedError(
+            "Login não foi confirmado após o envio do formulário"
+        )
 
+    except asyncio.CancelledError:
+        raise
+    except LoginError as exc:
+        logger.error("login_falhou", tipo=type(exc).__name__, error=str(exc))
+        raise
     except Exception as exc:
-        logger.error("erro_ao_verificar_ou_logar", error=str(exc))
-        return page
+        diagnostico = await _salvar_diagnostico_login(page, "erro_inesperado")
+        logger.error(
+            "erro_ao_verificar_ou_logar",
+            error=str(exc),
+            diagnostico=diagnostico,
+            exc_info=True,
+        )
+        raise LoginError(f"Erro inesperado durante o login: {exc}") from exc

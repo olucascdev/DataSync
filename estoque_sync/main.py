@@ -46,9 +46,13 @@ async def main() -> None:
     logger.info(
         "estoque_sync_iniciando",
         log_level=settings.log_level,
+        log_format=settings.log_format,
         sync_interval=settings.sync_interval_seconds,
+        sync_timeout=settings.sync_timeout_seconds,
+        sync_max_attempts=settings.sync_max_attempts,
         postgres_host=settings.postgres_host,
         chrome_headless=settings.chrome_headless,
+        login_diagnostics_dir=settings.login_diagnostics_dir,
     )
 
     # -------------------------------------------------------

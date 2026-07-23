@@ -29,9 +29,20 @@ class Settings(BaseSettings):
 
     # Scheduler
     sync_interval_seconds: int = 60
+    sync_timeout_seconds: int = 240
+    sync_max_attempts: int = 2
+    sync_retry_delay_seconds: float = 5.0
+
+    # Login / Turnstile
+    turnstile_max_attempts: int = 20
+    turnstile_retry_seconds: float = 2.0
+    login_redirect_timeout_seconds: int = 30
+    login_diagnostics_dir: str = "./logs"
 
     # Logging
     log_level: str = "INFO"
+    log_format: str = "console"
+    third_party_log_level: str = "WARNING"
 
     # Downloads
     download_dir: str = "./downloads"

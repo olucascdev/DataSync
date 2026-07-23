@@ -8,7 +8,9 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config.settings import settings
@@ -28,11 +30,66 @@ logger = get_logger("scheduler.jobs")
 # Mantém a sessão ASP.NET ativa e evita overhead de reiniciar
 _browser: Any = None
 _sync_lock: asyncio.Lock | None = None
+_falhas_consecutivas = 0
+
+
+async def _reiniciar_navegador(motivo: str) -> None:
+    """Fecha o navegador atual para a próxima tentativa começar limpa."""
+    global _browser
+
+    if _browser is None:
+        return
+
+    logger.warning("reiniciando_navegador", motivo=motivo)
+    try:
+        await fechar_navegador(_browser)
+    except Exception as exc:
+        logger.warning("erro_ao_reiniciar_navegador", motivo=motivo, error=str(exc))
+    finally:
+        _browser = None
+
+
+async def _executar_sync_com_retry() -> None:
+    """Executa o sync com poucas tentativas e navegador novo após falha."""
+    total_tentativas = max(1, settings.sync_max_attempts)
+
+    for tentativa in range(1, total_tentativas + 1):
+        try:
+            logger.info(
+                "sync_tentativa_iniciada",
+                tentativa=tentativa,
+                total_tentativas=total_tentativas,
+            )
+            await _sincronizar_estoque_impl()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "sync_tentativa_falhou",
+                tentativa=tentativa,
+                total_tentativas=total_tentativas,
+                error=str(exc),
+            )
+            await _reiniciar_navegador(
+                motivo=f"falha_tentativa_{tentativa}_{type(exc).__name__}"
+            )
+
+            if tentativa >= total_tentativas:
+                raise
+
+            logger.info(
+                "aguardando_nova_tentativa_sync",
+                segundos=settings.sync_retry_delay_seconds,
+            )
+            await asyncio.sleep(settings.sync_retry_delay_seconds)
 
 
 async def sincronizar_estoque() -> None:
     """Executa a sincronização impedindo concorrência no mesmo navegador."""
     global _sync_lock
+    global _browser
+    global _falhas_consecutivas
 
     if _sync_lock is None:
         _sync_lock = asyncio.Lock()
@@ -42,7 +99,42 @@ async def sincronizar_estoque() -> None:
         return
 
     async with _sync_lock:
-        await _sincronizar_estoque_impl()
+        sync_id = uuid4().hex[:8]
+        structlog.contextvars.bind_contextvars(sync_id=sync_id)
+        try:
+            logger.info(
+                "sync_ciclo_iniciado",
+                timeout_segundos=settings.sync_timeout_seconds,
+                max_tentativas=max(1, settings.sync_max_attempts),
+            )
+            await asyncio.wait_for(
+                _executar_sync_com_retry(),
+                timeout=settings.sync_timeout_seconds,
+            )
+            if _falhas_consecutivas:
+                logger.info(
+                    "sync_recuperado",
+                    falhas_consecutivas_anteriores=_falhas_consecutivas,
+                )
+            _falhas_consecutivas = 0
+        except TimeoutError:
+            _falhas_consecutivas += 1
+            logger.error(
+                "sync_timeout_estourado",
+                timeout_segundos=settings.sync_timeout_seconds,
+                falhas_consecutivas=_falhas_consecutivas,
+            )
+            await _reiniciar_navegador(motivo="sync_timeout")
+        except Exception as exc:
+            _falhas_consecutivas += 1
+            logger.error(
+                "sync_falhou_apos_tentativas",
+                total_tentativas=max(1, settings.sync_max_attempts),
+                falhas_consecutivas=_falhas_consecutivas,
+                error=str(exc),
+            )
+        finally:
+            structlog.contextvars.clear_contextvars()
 
 
 async def _sincronizar_estoque_impl() -> None:
@@ -142,7 +234,7 @@ async def _sincronizar_estoque_impl() -> None:
             detalhes = "Nenhum produto extraído do PDF"
             logger.warning("nenhum_produto_extraido")
             status = "error"
-            return
+            raise RuntimeError("Nenhum produto foi extraído do PDF")
 
         # -------------------------------------------------------
         # 4. Normalizar dados
@@ -167,10 +259,19 @@ async def _sincronizar_estoque_impl() -> None:
         status = "success"
         detalhes = {"msg": f"Sync concluído em {(datetime.now() - sync_start).total_seconds():.1f}s"}
 
+    except asyncio.CancelledError:
+        logger.error(
+            "sync_cancelado_por_timeout",
+            timeout_segundos=settings.sync_timeout_seconds,
+        )
+        status = "error"
+        detalhes = {"erro": "sync_cancelado_por_timeout"}
+        raise
     except Exception as exc:
         logger.error("sync_error", error=str(exc), exc_info=True)
         status = "error"
         detalhes = {"erro": str(exc)}
+        raise
 
     finally:
         # -------------------------------------------------------
@@ -231,6 +332,8 @@ def configurar_scheduler() -> AsyncIOScheduler:
     logger.info(
         "scheduler_configurado",
         intervalo_segundos=settings.sync_interval_seconds,
+        timeout_segundos=settings.sync_timeout_seconds,
+        max_tentativas=settings.sync_max_attempts,
     )
 
     return scheduler

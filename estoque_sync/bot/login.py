@@ -7,6 +7,7 @@ NUNCA desloga entre execuções para manter a sessão ASP.NET.
 import asyncio
 import json
 from datetime import datetime, timezone
+from math import ceil
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -61,19 +62,25 @@ async def _resolver_turnstile(page: Any) -> bool:
 
     O Turnstile interativo só preenche o input cf-turnstile-response após um
     clique real no checkbox. Localiza o iframe do widget, calcula a posição do
-    checkbox (lado esquerdo, centralizado verticalmente) e clica. Faz poll do
-    token entre tentativas. Retorna True quando o token é obtido.
+    checkbox (lado esquerdo, centralizado verticalmente) e clica. Após cada
+    clique, aguarda o ciclo de validação terminar antes de tentar novamente.
     """
     inicio = monotonic()
+    max_cliques = max(1, settings.turnstile_max_clicks)
+    intervalo_poll = max(0.1, settings.turnstile_poll_interval_seconds)
+    espera_token = max(intervalo_poll, settings.turnstile_token_wait_seconds)
+    polls_por_clique = max(1, ceil(espera_token / intervalo_poll))
+    cliques_enviados = 0
+
     logger.info(
         "turnstile_verificacao_iniciada",
-        max_tentativas=settings.turnstile_max_attempts,
-        intervalo_segundos=settings.turnstile_retry_seconds,
+        max_cliques=max_cliques,
+        espera_token_segundos=espera_token,
+        intervalo_poll_segundos=intervalo_poll,
     )
 
-    for tentativa in range(settings.turnstile_max_attempts):
-        numero_tentativa = tentativa + 1
-        estado = await _js(page, """
+    async def obter_estado() -> dict[str, Any]:
+        return await _js(page, """
             const inp = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
             if (inp && inp.value && inp.value.length > 0) return { temToken: true };
 
@@ -90,48 +97,87 @@ async def _resolver_turnstile(page: Any) -> bool:
             return { temToken: false, rect: { x: r.x, y: r.y, w: r.width, h: r.height } };
         """)
 
-        if estado.get("temToken"):
-            logger.info(
-                "turnstile_token_obtido",
-                tentativa=numero_tentativa,
-                duracao_segundos=round(monotonic() - inicio, 1),
-            )
-            return True
+    estado = await obter_estado()
+    if estado.get("temToken"):
+        logger.info(
+            "turnstile_token_ja_disponivel",
+            duracao_segundos=round(monotonic() - inicio, 1),
+        )
+        return True
 
+    for indice_clique in range(max_cliques):
+        numero_clique = indice_clique + 1
         rect = estado.get("rect")
+
         if rect and rect["w"] > 0 and rect["h"] > 0:
-            # Checkbox fica ~30px da borda esquerda, centralizado na vertical
+            logger.info(
+                "turnstile_widget_encontrado",
+                clique=numero_clique,
+                max_cliques=max_cliques,
+            )
+
+            # Checkbox fica ~30px da borda esquerda, centralizado na vertical.
             click_x = rect["x"] + 30
             click_y = rect["y"] + rect["h"] / 2
-            logger.debug(
-                "turnstile_clicando_widget",
-                tentativa=numero_tentativa,
-                x=click_x,
-                y=click_y,
-                rect=rect,
-            )
             try:
                 await _clicar_coordenada(page, click_x, click_y)
+                cliques_enviados += 1
+                logger.info(
+                    "turnstile_clique_enviado",
+                    clique=numero_clique,
+                    max_cliques=max_cliques,
+                    x=round(click_x, 1),
+                    y=round(click_y, 1),
+                )
             except Exception as exc:
                 logger.warning(
-                    "falha_ao_clicar_turnstile",
-                    tentativa=numero_tentativa,
+                    "turnstile_falha_ao_clicar",
+                    clique=numero_clique,
+                    max_cliques=max_cliques,
                     error=str(exc),
                 )
-
-        if numero_tentativa == 1 or numero_tentativa % 5 == 0:
-            logger.info(
-                "turnstile_aguardando_token",
-                tentativa=numero_tentativa,
-                max_tentativas=settings.turnstile_max_attempts,
-                widget_visivel=bool(rect),
+        else:
+            logger.warning(
+                "turnstile_widget_nao_encontrado",
+                rodada=numero_clique,
+                max_rodadas=max_cliques,
             )
 
-        await page.sleep(settings.turnstile_retry_seconds)
+        logger.info(
+            "turnstile_aguardando_token",
+            clique=numero_clique,
+            max_cliques=max_cliques,
+            limite_segundos=espera_token,
+            widget_visivel=bool(rect),
+        )
+
+        inicio_espera = monotonic()
+        for numero_poll in range(1, polls_por_clique + 1):
+            tempo_restante = espera_token - (numero_poll - 1) * intervalo_poll
+            await page.sleep(min(intervalo_poll, tempo_restante))
+            estado = await obter_estado()
+
+            if estado.get("temToken"):
+                logger.info(
+                    "turnstile_token_obtido",
+                    clique=numero_clique,
+                    poll=numero_poll,
+                    espera_apos_clique_segundos=round(monotonic() - inicio_espera, 1),
+                    duracao_segundos=round(monotonic() - inicio, 1),
+                )
+                return True
+
+        logger.warning(
+            "turnstile_rodada_sem_token",
+            clique=numero_clique,
+            max_cliques=max_cliques,
+            espera_segundos=espera_token,
+        )
 
     logger.warning(
         "turnstile_token_nao_obtido",
-        tentativas=settings.turnstile_max_attempts,
+        cliques_enviados=cliques_enviados,
+        max_cliques=max_cliques,
         duracao_segundos=round(monotonic() - inicio, 1),
     )
     return False

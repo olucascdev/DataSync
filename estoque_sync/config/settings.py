@@ -34,8 +34,9 @@ class Settings(BaseSettings):
     sync_retry_delay_seconds: float = 5.0
 
     # Login / Turnstile
-    turnstile_max_attempts: int = 20
-    turnstile_retry_seconds: float = 2.0
+    turnstile_max_clicks: int = 3
+    turnstile_token_wait_seconds: float = 15.0
+    turnstile_poll_interval_seconds: float = 1.0
     login_redirect_timeout_seconds: int = 30
     login_diagnostics_dir: str = "./logs"
 

@@ -5,6 +5,7 @@ from typing import Any
 import pandas as pd
 import psycopg
 
+from config.settings import settings
 from database.upsert import upsert_estoque
 from app.logging_config import get_logger
 
@@ -23,15 +24,22 @@ class EstoqueRepository:
         self.conn = conn
 
     def upsert_batch(self, df: pd.DataFrame) -> dict[str, int]:
-        """Realiza UPSERT em lote de produtos de estoque.
+        """Sincroniza estoque e aplica a politica diaria de preco.
 
         Args:
-            df: DataFrame com colunas: descricao, saldo_fisico, valor_venda
+            df: DataFrame normalizado, identificado por codigo_erp.
 
         Returns:
-            Dict com chaves "atualizados" e "inseridos".
+            Contadores de estoque, insercoes e precos.
         """
-        return upsert_estoque(self.conn, df)
+        return upsert_estoque(
+            self.conn,
+            df,
+            price_update_interval_hours=settings.price_update_interval_hours,
+            price_max_change_percent=settings.price_max_change_percent,
+            min_products=settings.sync_min_products,
+            max_product_drop_percent=settings.sync_max_product_drop_percent,
+        )
 
     def contar_registros(self) -> int:
         """Retorna o total de registros na tabela carla_produtos.

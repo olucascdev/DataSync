@@ -53,13 +53,16 @@ def _iniciar_display_virtual() -> None:
         logger.error("falha_ao_iniciar_display_virtual", error=str(exc))
         _virtual_display = None
 
-# Caminhos comuns do Brave Browser para auto-detecção
-BRAVE_PATHS = [
-    "/usr/bin/brave",
-    "/usr/bin/brave-browser",
-    "/usr/local/bin/brave",
-    "/usr/local/bin/brave-browser",
-    "/opt/brave.com/brave/brave",
+# Caminhos comuns do Google Chrome/Chromium para auto-detecção.
+CHROME_PATHS = [
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/local/bin/google-chrome-stable",
+    "/usr/local/bin/google-chrome",
+    "/usr/local/bin/chromium",
+    "/usr/local/bin/chromium-browser",
 ]
 
 
@@ -124,8 +127,8 @@ def _detectar_navegador() -> Optional[str]:
 
     Prioridade:
     1. Caminho explícito em settings.browser_executable_path
-    2. Auto-detecção do Brave nos caminhos comuns
-    3. Auto-detecção do Brave via PATH (shutil.which)
+    2. Auto-detecção do Google Chrome/Chromium nos caminhos comuns
+    3. Auto-detecção do Google Chrome/Chromium via PATH (shutil.which)
     4. None (fallback para Chrome padrão do nodriver)
 
     Returns:
@@ -143,29 +146,29 @@ def _detectar_navegador() -> Optional[str]:
             msg="Caminho configurado não existe, tentando auto-detectar",
         )
 
-    # 2. Auto-detecção do Brave em caminhos conhecidos
-    for caminho in BRAVE_PATHS:
+    # 2. Auto-detecção do Google Chrome/Chromium em caminhos conhecidos
+    for caminho in CHROME_PATHS:
         if os.path.isfile(caminho):
             logger.info("navegador_detectado", fonte="auto-detect-caminhos", caminho=caminho)
             return caminho
 
-    # 3. Auto-detecção do Brave via PATH
-    for nome in ("brave", "brave-browser"):
+    # 3. Auto-detecção do Google Chrome/Chromium via PATH
+    for nome in ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser"):
         caminho = shutil.which(nome)
         if caminho:
             logger.info("navegador_detectado", fonte="auto-detect-path", caminho=caminho)
             return caminho
 
     # 4. Fallback: Chrome padrão do nodriver
-    logger.info("navegador_nao_detectado", msg="Brave não encontrado, usando Chrome padrão do nodriver")
+    logger.info("navegador_nao_detectado", msg="Chrome/Chromium não encontrado, usando Chrome padrão do nodriver")
     return None
 
 
 async def iniciar_navegador() -> Any:
-    """Inicia o navegador Chrome/Brave usando nodriver.
+    """Inicia o navegador Chrome/Chromium usando nodriver.
 
     Usa perfil persistente para manter sessões ASP.NET entre execuções.
-    Detecta automaticamente o Brave Browser se disponível.
+    Detecta automaticamente o Google Chrome/Chromium se disponível.
 
     Returns:
         Instância do browser nodriver.

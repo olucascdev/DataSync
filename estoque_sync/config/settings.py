@@ -25,13 +25,23 @@ class Settings(BaseSettings):
     chrome_headless: bool = True
     chrome_profile_dir: str = "./data/chrome-profile"
     chrome_args: List[str] = []
-    browser_executable_path: str = ""  # Caminho absoluto do executável do navegador (ex: /usr/bin/brave). Vazio = auto-detectar.
+    browser_executable_path: str = ""  # Caminho absoluto do executável do navegador (ex: /usr/bin/google-chrome-stable). Vazio = auto-detectar.
 
     # Scheduler
-    sync_interval_seconds: int = 60
-    sync_timeout_seconds: int = 240
+    sync_interval_seconds: int = 3600
+    sync_interval_jitter_seconds: int = 300
+    sync_timeout_seconds: int = 1800
     sync_max_attempts: int = 2
-    sync_retry_delay_seconds: float = 5.0
+    sync_retry_delay_seconds: float = 300.0
+    sync_failure_threshold: int = 3
+    sync_failure_cooldown_seconds: int = 21600
+    sync_startup_min_interval_seconds: int = 1800
+    sync_min_products: int = 6000
+    sync_max_product_drop_percent: float = 10.0
+
+    # Politica de preco
+    price_update_interval_hours: int = 24
+    price_max_change_percent: float = 30.0
 
     # Login / Turnstile
     turnstile_max_clicks: int = 3

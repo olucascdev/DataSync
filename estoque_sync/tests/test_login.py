@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from bot.login import (
+    LoginError,
     LoginRejectedError,
     TurnstileTokenError,
     _resolver_turnstile,
@@ -170,6 +171,31 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(js_mock.await_count, 3)
         diagnostico_mock.assert_awaited_once_with(page, "turnstile_sem_token")
+
+    async def test_nao_considera_logado_quando_esta_na_pagina_login_sem_campos(self) -> None:
+        page = FakePage()
+        estado = {
+            "temLogin": False,
+            "ehPaginaLogin": True,
+            "url": "https://example.test/Account/Entrar?ReturnUrl=%2FRelatorio%2FEstoque",
+            "titulo": "Acesso ao sistema - Objetiva Web",
+        }
+
+        with (
+            patch(
+                "bot.login._js",
+                new=AsyncMock(return_value=estado),
+            ),
+            patch(
+                "bot.login._salvar_diagnostico_login",
+                new=AsyncMock(return_value={"screenshot": "falha.png"}),
+            ) as diagnostico_mock,
+        ):
+            with self.assertRaises(LoginError):
+                await verificar_ou_logar(object(), page)
+
+        self.assertEqual(page.sleep_calls, [1.5, 1.5, 1.5])
+        diagnostico_mock.assert_awaited_once_with(page, "pagina_login_sem_campos")
 
     async def test_retorna_somente_depois_do_redirect_confirmado(self) -> None:
         page = FakePage(redirect_on_sleep=True)

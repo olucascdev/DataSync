@@ -32,6 +32,12 @@ class LoginRejectedError(LoginError):
     """O formulário foi enviado, mas o sistema não autenticou a sessão."""
 
 
+def _url_indica_login(url: str | None) -> bool:
+    """Identifica URLs de tela de login do ERP."""
+    url_normalizada = (url or "").lower()
+    return "/account/entrar" in url_normalizada or "/login" in url_normalizada
+
+
 async def _js(page: Any, script: str) -> Any:
     """Executa JS e retorna resultado via JSON.stringify para evitar RemoteObject."""
     wrapped = f"(() => {{ const __r = (() => {{ {script} }})(); return JSON.stringify(__r); }})()"
@@ -305,14 +311,127 @@ async def verificar_ou_logar(browser: Any, page: Any) -> Any:
     logger.info("verificando_estado_de_login")
 
     try:
-        # Detectar se está na página de login verificando campos no DOM via JS
-        tem_login = await _js(page, """
-            const u = document.getElementById('Login') || document.querySelector('input[name="Login"]');
+        # Detectar se está na página de login verificando URL, título e campos.
+        # Algumas vezes o ERP redireciona para /Account/Entrar antes do DOM do
+        # formulário estar pronto; esse estado não pode ser tratado como logado.
+        estado_login = await _js(page, """
             const s = document.getElementById('Senha') || document.querySelector('input[name="Senha"]') || document.querySelector('input[type="password"]');
-            return !!(u && s);
+            const candidatosUsuario = Array.from(document.querySelectorAll('input'))
+                .filter((el) => {{
+                    const tipo = (el.type || '').toLowerCase();
+                    const nome = ((el.id || '') + ' ' + (el.name || '') + ' ' + (el.placeholder || '')).toUpperCase();
+                    return tipo !== 'password'
+                        && tipo !== 'hidden'
+                        && !el.disabled
+                        && (
+                            nome.includes('LOGIN')
+                            || nome.includes('EMAIL')
+                            || nome.includes('USUARIO')
+                            || nome.includes('USER')
+                        );
+                }});
+            const u = document.getElementById('Login')
+                || document.querySelector('input[name="Login"]')
+                || candidatosUsuario[0]
+                || (s ? Array.from(document.querySelectorAll('input')).find((el) => {
+                    const tipo = (el.type || '').toLowerCase();
+                    const r = el.getBoundingClientRect();
+                    return tipo !== 'password'
+                        && tipo !== 'hidden'
+                        && !el.disabled
+                        && r.width > 0
+                        && r.height > 0
+                        && r.top < s.getBoundingClientRect().top;
+                }) : null);
+            const url = location.href || '';
+            const titulo = document.title || '';
+            const ehPaginaLogin = url.includes('/Account/Entrar')
+                || url.toLowerCase().includes('/login')
+                || titulo.toUpperCase().includes('ACESSO AO SISTEMA');
+            return { temLogin: !!(u && s), ehPaginaLogin, url, titulo };
         """)
+        if isinstance(estado_login, bool):
+            tem_login = estado_login
+            eh_pagina_login = estado_login
+            url_login = page.url or ""
+            titulo_login = ""
+        else:
+            tem_login = bool(estado_login.get("temLogin"))
+            eh_pagina_login = bool(estado_login.get("ehPaginaLogin"))
+            url_login = estado_login.get("url") or page.url or ""
+            titulo_login = estado_login.get("titulo") or ""
+            eh_pagina_login = eh_pagina_login or _url_indica_login(page.url) or _url_indica_login(url_login)
+
+        for tentativa in range(1, 4):
+            if tem_login or not eh_pagina_login:
+                break
+            logger.info(
+                "pagina_login_sem_campos_aguardando_dom",
+                tentativa=tentativa,
+                url=url_login,
+                titulo=titulo_login,
+            )
+            await page.sleep(1.5)
+            estado_login = await _js(page, """
+                const s = document.getElementById('Senha') || document.querySelector('input[name="Senha"]') || document.querySelector('input[type="password"]');
+                const candidatosUsuario = Array.from(document.querySelectorAll('input'))
+                    .filter((el) => {
+                        const tipo = (el.type || '').toLowerCase();
+                        const nome = `${el.id || ''} ${el.name || ''} ${el.placeholder || ''}`.toUpperCase();
+                        return tipo !== 'password'
+                            && tipo !== 'hidden'
+                            && !el.disabled
+                            && (
+                                nome.includes('LOGIN')
+                                || nome.includes('EMAIL')
+                                || nome.includes('USUARIO')
+                                || nome.includes('USER')
+                            );
+                    });
+                const u = document.getElementById('Login')
+                    || document.querySelector('input[name="Login"]')
+                    || candidatosUsuario[0]
+                    || (s ? Array.from(document.querySelectorAll('input')).find((el) => {
+                        const tipo = (el.type || '').toLowerCase();
+                        const r = el.getBoundingClientRect();
+                        return tipo !== 'password'
+                            && tipo !== 'hidden'
+                            && !el.disabled
+                            && r.width > 0
+                            && r.height > 0
+                            && r.top < s.getBoundingClientRect().top;
+                    }) : null);
+                const url = location.href || '';
+                const titulo = document.title || '';
+                const ehPaginaLogin = url.includes('/Account/Entrar')
+                    || url.toLowerCase().includes('/login')
+                    || titulo.toUpperCase().includes('ACESSO AO SISTEMA');
+                return { temLogin: !!(u && s), ehPaginaLogin, url, titulo };
+            """)
+            tem_login = bool(estado_login.get("temLogin"))
+            eh_pagina_login = bool(estado_login.get("ehPaginaLogin"))
+            url_login = estado_login.get("url") or page.url or ""
+            titulo_login = estado_login.get("titulo") or ""
+            eh_pagina_login = eh_pagina_login or _url_indica_login(page.url) or _url_indica_login(url_login)
 
         if not tem_login:
+            if eh_pagina_login:
+                diagnostico = await _salvar_diagnostico_login(
+                    page,
+                    "pagina_login_sem_campos",
+                )
+                logger.warning(
+                    "pagina_login_sem_campos",
+                    url=url_login,
+                    titulo=titulo_login,
+                    screenshot=diagnostico.get("screenshot"),
+                    metadata=diagnostico.get("metadata"),
+                    html=diagnostico.get("html"),
+                )
+                raise LoginError(
+                    "Página de login carregou, mas os campos de usuário/senha "
+                    "não foram encontrados"
+                )
             logger.info("usuario_ja_esta_logado_sessao_persistente")
             return page
 
@@ -343,8 +462,34 @@ async def verificar_ou_logar(browser: Any, page: Any) -> Any:
 
         # ETAPA 1: preencher as credenciais (SEM submeter ainda)
         preenchido = await _js(page, f"""
-            const usuario = document.getElementById('Login') || document.querySelector('input[name="Login"]');
             const senha = document.getElementById('Senha') || document.querySelector('input[name="Senha"]') || document.querySelector('input[type="password"]');
+            const candidatosUsuario = Array.from(document.querySelectorAll('input'))
+                .filter((el) => {{
+                    const tipo = (el.type || '').toLowerCase();
+                    const nome = ((el.id || '') + ' ' + (el.name || '') + ' ' + (el.placeholder || '')).toUpperCase();
+                    return tipo !== 'password'
+                        && tipo !== 'hidden'
+                        && !el.disabled
+                        && (
+                            nome.includes('LOGIN')
+                            || nome.includes('EMAIL')
+                            || nome.includes('USUARIO')
+                            || nome.includes('USER')
+                        );
+                }});
+            const usuario = document.getElementById('Login')
+                || document.querySelector('input[name="Login"]')
+                || candidatosUsuario[0]
+                || (senha ? Array.from(document.querySelectorAll('input')).find((el) => {{
+                    const tipo = (el.type || '').toLowerCase();
+                    const r = el.getBoundingClientRect();
+                    return tipo !== 'password'
+                        && tipo !== 'hidden'
+                        && !el.disabled
+                        && r.width > 0
+                        && r.height > 0
+                        && r.top < senha.getBoundingClientRect().top;
+                }}) : null);
             if (!usuario || !senha) return {{ ok: false, motivo: 'campos_nao_encontrados' }};
 
             const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;

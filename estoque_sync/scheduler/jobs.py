@@ -5,6 +5,7 @@ Configura e executa o job periódico de sincronização usando APScheduler.
 
 import asyncio
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,11 @@ from config.settings import settings
 from app.logging_config import get_logger, log_sync_to_db
 from database.postgres import get_pool, get_connection
 from database.repositories import EstoqueRepository
-from database.upsert import upsert_estoque
+from database.sync_control import (
+    adquirir_lease,
+    liberar_lease,
+    pode_executar_sync_inicial,
+)
 from parser.pdf_parser import extrair_produtos_pdf
 from parser.normalizador import normalizar_df
 from bot.navegador import iniciar_navegador, fechar_navegador
@@ -31,6 +36,7 @@ logger = get_logger("scheduler.jobs")
 _browser: Any = None
 _sync_lock: asyncio.Lock | None = None
 _falhas_consecutivas = 0
+_circuito_aberto_ate = 0.0
 
 
 async def _reiniciar_navegador(motivo: str) -> None:
@@ -90,6 +96,15 @@ async def sincronizar_estoque() -> None:
     global _sync_lock
     global _browser
     global _falhas_consecutivas
+    global _circuito_aberto_ate
+
+    agora = time.monotonic()
+    if agora < _circuito_aberto_ate:
+        logger.warning(
+            "sync_ignorado_por_circuit_breaker",
+            segundos_restantes=round(_circuito_aberto_ate - agora),
+        )
+        return
 
     if _sync_lock is None:
         _sync_lock = asyncio.Lock()
@@ -101,7 +116,17 @@ async def sincronizar_estoque() -> None:
     async with _sync_lock:
         sync_id = uuid4().hex[:8]
         structlog.contextvars.bind_contextvars(sync_id=sync_id)
+        lease_adquirido = False
+        sucesso = False
         try:
+            lease_adquirido = await asyncio.to_thread(
+                _adquirir_lease_sync,
+                sync_id,
+            )
+            if not lease_adquirido:
+                logger.warning("sync_ignorado_por_lease_de_outra_instancia")
+                return
+
             logger.info(
                 "sync_ciclo_iniciado",
                 timeout_segundos=settings.sync_timeout_seconds,
@@ -117,6 +142,8 @@ async def sincronizar_estoque() -> None:
                     falhas_consecutivas_anteriores=_falhas_consecutivas,
                 )
             _falhas_consecutivas = 0
+            _circuito_aberto_ate = 0.0
+            sucesso = True
         except TimeoutError:
             _falhas_consecutivas += 1
             logger.error(
@@ -134,6 +161,28 @@ async def sincronizar_estoque() -> None:
                 error=str(exc),
             )
         finally:
+            if (
+                _falhas_consecutivas >= settings.sync_failure_threshold
+                and not sucesso
+            ):
+                _circuito_aberto_ate = (
+                    time.monotonic() + settings.sync_failure_cooldown_seconds
+                )
+                logger.error(
+                    "circuit_breaker_ativado",
+                    falhas_consecutivas=_falhas_consecutivas,
+                    cooldown_segundos=settings.sync_failure_cooldown_seconds,
+                )
+
+            if lease_adquirido:
+                try:
+                    await asyncio.to_thread(
+                        _liberar_lease_sync,
+                        sync_id,
+                        sucesso,
+                    )
+                except Exception as exc:
+                    logger.error("falha_ao_liberar_lease_sync", error=str(exc))
             structlog.contextvars.clear_contextvars()
 
 
@@ -254,10 +303,16 @@ async def _sincronizar_estoque_impl() -> None:
             "upsert_finished",
             atualizados=total_atualizados,
             criados=total_criados,
+            precos_atualizados=resultado["precos_atualizados"],
+            precos_bloqueados=resultado["precos_bloqueados"],
         )
 
         status = "success"
-        detalhes = {"msg": f"Sync concluído em {(datetime.now() - sync_start).total_seconds():.1f}s"}
+        detalhes = {
+            "msg": f"Sync concluído em {(datetime.now() - sync_start).total_seconds():.1f}s",
+            "precos_atualizados": resultado["precos_atualizados"],
+            "precos_bloqueados": resultado["precos_bloqueados"],
+        }
 
     except asyncio.CancelledError:
         logger.error(
@@ -291,14 +346,17 @@ async def _sincronizar_estoque_impl() -> None:
             logger.warning("falha_ao_logar_sync", error=str(exc))
 
         # -------------------------------------------------------
-        # 7. Limpar PDF temporário
+        # 7. Limpar PDF temporário quando o sync termina com sucesso.
         # -------------------------------------------------------
         if caminho_pdf and os.path.exists(caminho_pdf):
-            try:
-                os.remove(caminho_pdf)
-                logger.info("pdf_temporario_removido", caminho=caminho_pdf)
-            except Exception as exc:
-                logger.warning("falha_ao_remover_pdf", caminho=caminho_pdf, error=str(exc))
+            if status == "success":
+                try:
+                    os.remove(caminho_pdf)
+                    logger.info("pdf_temporario_removido", caminho=caminho_pdf)
+                except Exception as exc:
+                    logger.warning("falha_ao_remover_pdf", caminho=caminho_pdf, error=str(exc))
+            else:
+                logger.warning("pdf_preservado_para_diagnostico", caminho=caminho_pdf)
 
         duracao = (datetime.now() - sync_start).total_seconds()
         logger.info(
@@ -323,8 +381,10 @@ def configurar_scheduler() -> AsyncIOScheduler:
         sincronizar_estoque,
         "interval",
         seconds=settings.sync_interval_seconds,
+        jitter=settings.sync_interval_jitter_seconds,
         id="sync_estoque",
         max_instances=1,
+        coalesce=True,
         replace_existing=True,
         name="Sincronização de Estoque",
     )
@@ -332,6 +392,7 @@ def configurar_scheduler() -> AsyncIOScheduler:
     logger.info(
         "scheduler_configurado",
         intervalo_segundos=settings.sync_interval_seconds,
+        jitter_segundos=settings.sync_interval_jitter_seconds,
         timeout_segundos=settings.sync_timeout_seconds,
         max_tentativas=settings.sync_max_attempts,
     )
@@ -373,6 +434,45 @@ def _upsert_sync(df_norm):
     with get_connection() as conn:
         repo = EstoqueRepository(conn)
         return repo.upsert_batch(df_norm)
+
+
+def _adquirir_lease_sync(owner: str) -> bool:
+    """Reserva o coletor no banco antes de acessar o ERP."""
+    with get_connection() as conn:
+        return adquirir_lease(
+            conn,
+            owner,
+            lease_seconds=settings.sync_timeout_seconds + 300,
+        )
+
+
+def _liberar_lease_sync(owner: str, success: bool) -> None:
+    """Libera a reserva persistente ao terminar o ciclo."""
+    with get_connection() as conn:
+        liberar_lease(
+            conn,
+            owner,
+            success=success,
+            failure_threshold=settings.sync_failure_threshold,
+            failure_cooldown_seconds=settings.sync_failure_cooldown_seconds,
+        )
+
+
+async def deve_executar_sync_inicial() -> bool:
+    """Consulta o banco antes do acesso imediato feito na inicializacao."""
+    try:
+        return await asyncio.to_thread(_pode_executar_sync_inicial_sync)
+    except Exception as exc:
+        logger.error("falha_ao_verificar_sync_inicial", error=str(exc))
+        return False
+
+
+def _pode_executar_sync_inicial_sync() -> bool:
+    with get_connection() as conn:
+        return pode_executar_sync_inicial(
+            conn,
+            settings.sync_startup_min_interval_seconds,
+        )
 
 
 def _log_sync_sync(origem, status, total_recebidos, total_atualizados, total_criados, detalhes):

@@ -82,13 +82,19 @@ async def main() -> None:
     scheduler.start()
 
     # Executar o primeiro job imediatamente
-    from scheduler.jobs import sincronizar_estoque
+    from scheduler.jobs import deve_executar_sync_inicial, sincronizar_estoque
 
-    logger.info("executando_primeiro_sync_imediato")
-    try:
-        await sincronizar_estoque()
-    except Exception as exc:
-        logger.error("erro_no_primeiro_sync", error=str(exc))
+    if await deve_executar_sync_inicial():
+        logger.info("executando_primeiro_sync_imediato")
+        try:
+            await sincronizar_estoque()
+        except Exception as exc:
+            logger.error("erro_no_primeiro_sync", error=str(exc))
+    else:
+        logger.info(
+            "sync_inicial_ignorado_por_execucao_recente",
+            intervalo_minimo_segundos=settings.sync_startup_min_interval_seconds,
+        )
 
     # -------------------------------------------------------
     # Manter programa rodando

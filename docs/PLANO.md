@@ -1,312 +1,157 @@
-# 📋 PLANO DEFINITIVO v4.0
-## SINCRONIZAÇÃO ESTOQUE OBJETIVA → POSTGRES → N8N
+# Plano de sincronizacao por codigo
 
----
+## Objetivo
 
-## ✅ ESCOPO CONFIRMADO
+Reduzir o risco de preco incorreto sem deixar o estoque desatualizado. O
+relatorio do ERP continua sendo baixado uma unica vez por ciclo. Depois da
+extracao, cada campo segue uma politica de escrita diferente:
 
-| Origem (PDF) | Destino (PostgreSQL) | Tipo | Regra |
-|--------------|----------------------|------|-------|
-| **Descrição** | `descricao` | `TEXT NOT NULL` | Chave natural do UPSERT |
-| **Quantidade** | `saldo_fisico` | `NUMERIC(12,4)` | `DEFAULT 0` |
-| **Valor** | `valor_venda` | `NUMERIC(10,2)` | Populado pelo PDF |
-| — | `marca` | `TEXT` | `NULL` (não vem do PDF) |
-| — | `peso_kg` | `NUMERIC(10,3)` | `NULL` (não vem do PDF) |
-| — | `altura_cm` | `NUMERIC(10,2)` | `NULL` (não vem do PDF) |
-| — | `largura_cm` | `NUMERIC(10,2)` | `NULL` (não vem do PDF) |
-| — | `comprimento_cm` | `NUMERIC(10,2)` | `NULL` (não vem do PDF) |
-| — | `updated_at` | `TIMESTAMPTZ` | `NOW()` |
-
-> **Decisão:** O relatório padrão já traz tudo que precisamos. **Não é necessário** acessar a aba "Colunas a imprimir". O bot gera o relatório padrão direto.
-
----
-
-## 🗄️ SCHEMA — RESPEITANDO O DUMP EXISTENTE
-
-Nenhuma alteração no schema. Usar a tabela `carla_produtos` exatamente como está:
-
-```sql
-CREATE TABLE public.carla_produtos (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    marca text,
-    descricao text NOT NULL,
-    saldo_fisico numeric(12,4) DEFAULT 0,
-    valor_venda numeric(10,2),
-    peso_kg numeric(10,3),
-    altura_cm numeric(10,2),
-    largura_cm numeric(10,2),
-    comprimento_cm numeric(10,2),
-    updated_at timestamp with time zone DEFAULT now()
-);
+```text
+ERP / PDF (a cada 60 minutos)
+        |
+        v
+Parser e validacao por codigo_erp
+        |
+        +-- produto novo: cadastra nome, marca, preco e estoque
+        +-- produto existente: atualiza somente estoque
+        `-- preco vencido ha 24h: atualiza se passar nas validacoes
 ```
 
-### Estratégia de UPSERT por `descricao`
+Nao serao criados dois robos acessando o ERP. A separacao acontece na camada
+de persistencia, evitando downloads e logins duplicados.
 
-Como não há `UNIQUE` em `descricao`, usamos **CTE com `UPDATE` + `INSERT`**:
+## Decisoes
 
-```sql
-WITH dados AS (
-    SELECT 
-        descricao,
-        saldo_fisico,
-        valor_venda
-    FROM staging_temp
-),
-atualizados AS (
-    UPDATE carla_produtos p
-    SET 
-        saldo_fisico = d.saldo_fisico,
-        valor_venda = d.valor_venda,
-        updated_at = NOW()
-    FROM dados d
-    WHERE p.descricao = d.descricao
-    RETURNING p.descricao
-)
-INSERT INTO carla_produtos (descricao, saldo_fisico, valor_venda, updated_at)
-SELECT descricao, saldo_fisico, valor_venda, NOW()
-FROM dados d
-WHERE d.descricao NOT IN (SELECT descricao FROM atualizados);
+| Assunto | Decisao |
+|---|---|
+| Identidade do produto | `codigo_erp`, preservado como `TEXT` |
+| Frequencia do relatorio | 60 minutos, com jitter configuravel |
+| Produto novo | Insere todos os campos disponiveis |
+| Produto existente | Atualiza `saldo_fisico` em cada relatorio valido |
+| Preco existente | Atualiza quando `preco_atualizado_em` completar 24 horas |
+| Nome, marca e dimensoes existentes | Nao sao sobrescritos automaticamente |
+| Preco com variacao alta | Mantem preco atual e envia para quarentena |
+| Produto ausente do PDF | Nao e removido nem zerado |
+| Concorrencia | Lease persistente no PostgreSQL e lock local |
+| Falhas repetidas | Circuit breaker suspende novos acessos temporariamente |
+
+## Fases de implantacao
+
+### 1. Migracao do banco
+
+Aplicar `estoque_sync/database/migrations/001_codigo_erp_e_controle_sync.sql`.
+A migracao:
+
+- adiciona `codigo_erp` e `preco_atualizado_em` a `carla_produtos`;
+- cria indice unico parcial para codigos preenchidos;
+- cria `carla_preco_divergencias` para auditoria de precos bloqueados;
+- cria `carla_sync_control` para lease e controle de reinicios.
+
+Antes da aplicacao, fazer backup de `carla_produtos`.
+
+### 2. Associacao dos produtos existentes
+
+Executar primeiro em modo de simulacao:
+
+```bash
+cd estoque_sync
+python scripts/backfill_codigos.py \
+  --pdf ../RelatorioEstoque_carlabaleeiro_2026_06_12_1326.pdf \
+  --report ../docs/backfill-codigos.json
 ```
 
----
+O script associa somente descricoes exatas e unicas. Casos ambiguos ficam no
+relatorio para revisao. Depois de revisar:
 
-## 🤖 FLUXO DO BOT (SIMPLIFICADO)
-
-```
-1. INICIAR NODRIVER
-   └── Perfil persistente: ./data/chrome-profile
-   └── Sessão ASP.NET reaproveitada
-
-2. NAVEGAR
-   └── Sidebar: Estoque → Relatório → Relatório de Estoque
-   └── URL: https://carlabaleeiro.objetivaweb.app.br/Relatorio/Estoque
-
-3. PREENCHER FILTROS
-   ├── Filial: Acumular Saldo = "Todas"
-   ├── Tabela de Preço: "1 - PADRAO"
-   ├── Modelo: "Saldo Produto"
-   └── Formato: "A4 Paisagem"
-
-4. GERAR RELATÓRIO
-   └── Clicar: [Visualizar]
-   └── Aguardar nova aba (target="_blank")
-
-5. BAIXAR PDF
-   └── Aguardar download automático
-   └── Salvar: downloads/estoque_{timestamp}.pdf
-   └── Validar: tamanho > 0
-
-6. FECHAR ABA PDF
-   └── Manter aba principal logada
+```bash
+python scripts/backfill_codigos.py \
+  --pdf ../RelatorioEstoque_carlabaleeiro_2026_06_12_1326.pdf \
+  --report ../docs/backfill-codigos-aplicado.json \
+  --apply
 ```
 
-> **NÃO é necessário** acessar a aba "Colunas a imprimir". O relatório padrão já traz Descrição + Valor + Quantidade.
+O servico bloqueia a sincronizacao enquanto existir qualquer produto legado
+com `codigo_erp` vazio. Isso impede que uma associacao nao resolvida seja
+inserida novamente como produto novo.
 
----
+### 3. Validacao do relatorio
 
-## 📄 EXTRAÇÃO PDF
+Um ciclo inteiro falha sem alterar o banco quando ocorrer qualquer uma destas
+condicoes:
 
-### Parser (`parser/pdf_parser.py`)
+- codigo vazio, nao numerico ou duplicado;
+- descricao vazia;
+- preco ou estoque nao numerico;
+- preco menor ou igual a zero;
+- quantidade de produtos abaixo de `SYNC_MIN_PRODUCTS`;
+- queda maior que `SYNC_MAX_PRODUCT_DROP_PERCENT` em relacao ao cadastro com
+  codigo.
 
-**Estrutura do PDF confirmada:**
-- 116 páginas, ~6.713 produtos
-- Cabeçalho fixo por página (ignorar)
-- Rodapé fixo (ignorar)
-- Total Geral na última página (ignorar)
-- Linha de filtros na página 1 (ignorar)
+Essa politica e intencionalmente "fail closed": um PDF suspeito nunca produz
+uma atualizacao parcial.
 
-**Padrão de linha:**
-```
-2 OCEANE ESPONJA MS FLAT BLEND VINHO        49,90    1,00
-1 PRODUTO NAO CONTROLADO                     2,00   35.549,00
-```
+### 4. Politica de escrita
 
-**Regex:**
-```python
-^\s*(\d+)\s+(.+?)\s+([\d.,]+)\s+([\d.,]+)\s*$
-# Grupo 1: Número sequencial (descartar)
-# Grupo 2: Descrição
-# Grupo 3: Valor unitário
-# Grupo 4: Quantidade (saldo)
-```
+A gravacao ocorre em uma unica transacao:
 
-**Tratamento de descrições longas:**
-- Usar coordenadas Y do PyMuPDF para agrupar linhas quebradas
-- Ou heuristicamente: se a linha não começa com número + espaço, é continuação da anterior
+1. Atualiza estoque de produtos encontrados por `codigo_erp`.
+2. Identifica precos que ja podem ser atualizados.
+3. Bloqueia e registra variacoes acima de `PRICE_MAX_CHANGE_PERCENT`.
+4. Atualiza os demais precos vencidos.
+5. Insere produtos novos com todos os campos.
 
-### Normalizador (`parser/normalizador.py`)
+Reprocessar o mesmo PDF e idempotente: nao cria produtos duplicados e nao
+antecipa a proxima atualizacao de preco.
 
-```python
-def parse_decimal(valor_str: str) -> Decimal:
-    # "35.549,00" → "35549.00"
-    # "49,90" → "49.90"
-    return Decimal(valor_str.replace(".", "").replace(",", "."))
+### 5. Protecao do ERP
 
-def normalizar(df: pd.DataFrame) -> pd.DataFrame:
-    return df.assign(
-        descricao=lambda x: x["descricao"].str.strip().str.upper(),
-        saldo_fisico=lambda x: x["quantidade"].apply(parse_decimal),
-        valor_venda=lambda x: x["valor"].apply(parse_decimal),
-    )[["descricao", "saldo_fisico", "valor_venda"]]
-```
+Configuracao inicial recomendada:
 
----
-
-## 🗄️ CAMADA DE DADOS
-
-### Conexão (`database/postgres.py`)
-- `psycopg` com pool (max 5 conexões — respeitar limites do Neon)
-- Connection string via `.env`
-- Retry automático
-
-### UPSERT (`database/upsert.py`)
-- `execute_values` para batch insert em tabela temporária
-- CTE `UPDATE` + `INSERT` na `carla_produtos`
-- Transação única (atomic)
-- Log no `carla_sync_logs`
-
-### Repositório (`database/repositories.py`)
-```python
-class EstoqueRepository:
-    def upsert_batch(self, df: pd.DataFrame) -> dict:
-        # Retorna: {"atualizados": N, "inseridos": M}
-        pass
-    
-    def contar_registros(self) -> int:
-        pass
+```env
+SYNC_INTERVAL_SECONDS=3600
+SYNC_INTERVAL_JITTER_SECONDS=300
+SYNC_TIMEOUT_SECONDS=1800
+SYNC_MAX_ATTEMPTS=2
+SYNC_RETRY_DELAY_SECONDS=300
+SYNC_FAILURE_THRESHOLD=3
+SYNC_FAILURE_COOLDOWN_SECONDS=21600
+SYNC_STARTUP_MIN_INTERVAL_SECONDS=1800
+PRICE_UPDATE_INTERVAL_HOURS=24
+PRICE_MAX_CHANGE_PERCENT=30
+SYNC_MIN_PRODUCTS=6000
+SYNC_MAX_PRODUCT_DROP_PERCENT=10
 ```
 
----
+O sync imediato da inicializacao e ignorado quando houve outra tentativa
+recente. Depois de tres ciclos com falha, o circuit breaker espera seis horas.
+Erros nao disparam tentativas em sequencia com intervalo de poucos segundos.
 
-## ⏰ SCHEDULER
+## Implantacao segura
 
-### Job (`scheduler/jobs.py`)
-```python
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+1. Fazer backup e aplicar a migracao.
+2. Rodar o backfill sem `--apply`.
+3. Revisar ambiguidades e salvar o relatorio gerado.
+4. Aplicar o backfill.
+5. Executar os testes automatizados.
+6. Subir o servico com o preco observado nos logs.
+7. Conferir dois ou tres ciclos de estoque.
+8. Auditar diariamente `carla_preco_divergencias`.
 
-scheduler.add_job(
-    sincronizar_estoque,
-    "interval",
-    seconds=60,
-    id="sync_estoque",
-    max_instances=1,  # Evita sobreposição
-    replace_existing=True,
-)
-```
+## Rollback
 
-### Fluxo do Job
-```
-1. Log: sync_start → carla_sync_logs
-2. Iniciar navegador (reutilizar sessão)
-3. Navegar e gerar PDF
-4. Baixar PDF
-5. Log: pdf_downloaded
-6. Extrair dados (PyMuPDF)
-7. Log: pdf_parsed (quantidade)
-8. Normalizar DataFrame
-9. UPSERT em lote
-10. Log: upsert_finished (atualizados, inseridos)
-11. Limpar PDF temporário
-12. Log: sync_completed
-```
+Em caso de problema, parar o servico novo e voltar a imagem anterior. As
+colunas e tabelas adicionadas podem permanecer no banco porque sao
+retrocompativeis. Nao remover `codigo_erp` antes de exportar o mapeamento feito
+pelo backfill.
 
----
+## Criterios de aceite
 
-## 📝 LOGS
-
-### Arquivo JSON (`logs/estoque_sync_YYYYMMDD.jsonl`)
-```json
-{"evento":"sync_start","timestamp":"2026-06-11T16:30:00Z"}
-{"evento":"pdf_downloaded","arquivo":"estoque_2026_06_11_163000.pdf","paginas":116,"tamanho_bytes":1234567}
-{"evento":"pdf_parsed","produtos":6713,"colunas":["descricao","valor_venda","saldo_fisico"]}
-{"evento":"upsert_finished","atualizados":6668,"inseridos":45,"erros":0}
-{"evento":"sync_completed","duracao_segundos":42}
-```
-
-### Banco (`carla_sync_logs`)
-```sql
-INSERT INTO carla_sync_logs (origem, status, total_recebidos, total_atualizados, total_criados, started_at)
-VALUES ('objetiva_estoque', 'concluido', 6713, 6668, 45, NOW());
-```
-
----
-
-## 🐳 DOCKER
-
-### `Dockerfile`
-```dockerfile
-FROM python:3.12-slim
-
-RUN apt-get update && apt-get install -y \
-    wget gnupg fonts-liberation libasound2 libatk-bridge2.0-0 \
-    libgtk-3-0 libnss3 libxss1 libxtst6 xdg-utils \
-    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
-    && apt-get update && apt-get install -y google-chrome-stable \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-RUN mkdir -p /app/downloads /app/logs /app/data/chrome-profile
-
-CMD ["python", "main.py"]
-```
-
-### `docker-compose.yml`
-```yaml
-version: '3.8'
-
-services:
-  estoque-sync:
-    build: .
-    environment:
-      - POSTGRES_HOST=${POSTGRES_HOST}
-      - POSTGRES_PORT=5432
-      - POSTGRES_DB=carla_db
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - OBJETIVA_URL=https://carlabaleeiro.objetivaweb.app.br
-      - CHROME_HEADLESS=true
-      - SYNC_INTERVAL_SECONDS=60
-      - LOG_LEVEL=INFO
-    volumes:
-      - ./data/chrome-profile:/app/data/chrome-profile
-      - ./downloads:/app/downloads
-      - ./logs:/app/logs
-    restart: unless-stopped
-    cap_add:
-      - SYS_ADMIN
-    security_opt:
-      - seccomp=unconfined
-```
-
-> **Nota:** Em produção (VPS), o PostgreSQL é externo (Neon). Não precisa de serviço `postgres` no compose.
-
----
-
-## 📅 CRONOGRAMA FINAL
-
-| Fase | Tempo | Entregável |
-|------|-------|------------|
-| 1. Scaffold | 2h | Estrutura de pastas, `requirements.txt`, `.env`, config Pydantic |
-| 2. Logging | 1h | Structlog + integração `carla_sync_logs` |
-| 3. Postgres | 2h | Conexão, pool, repositório, CTE UPSERT |
-| 4. Parser | 3h | PyMuPDF, regex, normalizador, teste com PDF real |
-| 5. Nodriver | 4h | Perfil persistente, navegação, filtros, download |
-| 6. Scheduler | 1h | APScheduler, job integrado, anti-sobreposição |
-| 7. Docker | 2h | Dockerfile, compose, teste local |
-| 8. Testes | 2h | Integração completa, validar 6713 produtos |
-| 9. Deploy | 2h | VPS, Neon, systemd ou compose |
-
-**Total estimado:** ~19 horas de trabalho concentrado.
-
----
-
-## 🎯 PRÓXIMO PASSO
-
-Iniciar implementação: criar scaffold do projeto (pastas, configs, requirements, `.env` template) e seguir módulo por módulo.
-
----
+- o parser retorna codigo, nome, preco e estoque da mesma linha;
+- o PDF de referencia produz 6.578 produtos e 6.578 codigos unicos;
+- nenhum produto existente tem o preco alterado no ciclo comum;
+- produto novo entra completo;
+- preco elegivel e atualizado somente depois do intervalo configurado;
+- variacao suspeita nao altera o produto;
+- dois processos nao geram o relatorio ao mesmo tempo;
+- reiniciar o container nao causa uma sequencia de acessos ao ERP;
+- PDF invalido nao altera nenhuma linha.

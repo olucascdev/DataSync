@@ -98,6 +98,7 @@ skills-lock.json
 # Database dumps (contain sensitive data — never commit)
 *.sql
 dump.sql
+!estoque_sync/database/migrations/*.sql
 
 # Scraped/downloaded HTML and PDF artifacts
 *.pdf

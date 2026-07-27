@@ -29,8 +29,8 @@ Objetiva Web (ERP)
        ▼
    PostgreSQL
        │
-       │  Staging table → CTE UPDATE + INSERT
-       │  Chave de upsert: descrição do produto
+       │  Staging table → transação de estoque/preço
+       │  Chave de upsert: código fixo do ERP
        ▼
    carla_produtos (tabela atualizada)
        │
@@ -57,10 +57,18 @@ POSTGRES_USER=carla
 POSTGRES_PASSWORD=troque_esta_senha
 
 # Comportamento
-SYNC_INTERVAL_SECONDS=300       # intervalo entre sincronizações
-SYNC_TIMEOUT_SECONDS=240        # limite máximo de duração de cada ciclo
+SYNC_INTERVAL_SECONDS=3600      # um relatório por hora
+SYNC_INTERVAL_JITTER_SECONDS=300
+SYNC_TIMEOUT_SECONDS=1800       # inclui extração das páginas do PDF
 SYNC_MAX_ATTEMPTS=2             # tentativas por ciclo antes de falhar
-SYNC_RETRY_DELAY_SECONDS=5      # espera entre tentativas
+SYNC_RETRY_DELAY_SECONDS=300    # cinco minutos entre tentativas
+SYNC_FAILURE_THRESHOLD=3
+SYNC_FAILURE_COOLDOWN_SECONDS=21600
+SYNC_STARTUP_MIN_INTERVAL_SECONDS=1800
+SYNC_MIN_PRODUCTS=6000
+SYNC_MAX_PRODUCT_DROP_PERCENT=10
+PRICE_UPDATE_INTERVAL_HOURS=24
+PRICE_MAX_CHANGE_PERCENT=30
 CHROME_HEADLESS=false           # true para rodar sem interface
 DOWNLOAD_DIR=/app/downloads     # onde os PDFs ficam temporariamente
 
@@ -96,7 +104,28 @@ git clone <repo> estoque_sync && cd estoque_sync
 cp estoque_sync/.env.example estoque_sync/.env
 nano estoque_sync/.env   # preencher credenciais
 
-# 3. Subir
+# 3. Subir somente o PostgreSQL
+docker compose --env-file estoque_sync/.env up -d postgres
+
+# 4. Aplicar a migração obrigatória
+docker compose --env-file estoque_sync/.env exec -T postgres \
+  sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  < estoque_sync/database/migrations/001_codigo_erp_e_controle_sync.sql
+
+# 5. Simular e revisar a associação dos códigos existentes
+cd estoque_sync
+python scripts/backfill_codigos.py \
+  --pdf ../RelatorioEstoque_carlabaleeiro_2026_06_12_1326.pdf \
+  --report ../docs/backfill-codigos.json
+
+# 6. Aplicar somente as associações exatas e únicas
+python scripts/backfill_codigos.py \
+  --pdf ../RelatorioEstoque_carlabaleeiro_2026_06_12_1326.pdf \
+  --report ../docs/backfill-codigos-aplicado.json \
+  --apply
+cd ..
+
+# 7. Subir a aplicação
 docker compose --env-file estoque_sync/.env up -d --build
 ```
 
@@ -147,17 +176,21 @@ O bot preenche automaticamente o formulário em `/Relatorio/Estoque` com:
 
 **Reutilização do browser**: o browser fica aberto entre ciclos de sincronização para reaproveitar o cookie de sessão ASP.NET do ERP. O login só é refeito quando a sessão expira.
 
-**Primeiro sync imediato**: ao iniciar, a aplicação configura o scheduler e executa uma sincronização imediatamente, antes de aguardar o próximo intervalo.
+**Primeiro sync protegido**: ao iniciar, a aplicação só executa imediatamente quando não houve outra tentativa nos últimos 30 minutos. Isso evita que reinícios em loop gerem acessos repetidos ao ERP.
 
-**Concorrência**: um `asyncio.Lock` garante que apenas um job roda por vez. Se o scheduler disparar enquanto o anterior ainda está em execução, o novo disparo é ignorado e registrado em log.
+**Concorrência**: um `asyncio.Lock` protege o processo e um lease em `carla_sync_control` protege contra dois containers acessando o ERP ao mesmo tempo.
 
-**Timeout e retry**: cada ciclo respeita `SYNC_TIMEOUT_SECONDS`. Em falhas, o navegador é reiniciado e o ciclo tenta novamente até `SYNC_MAX_ATTEMPTS`, com pausa definida por `SYNC_RETRY_DELAY_SECONDS`.
+**Timeout, retry e circuit breaker**: cada ciclo respeita `SYNC_TIMEOUT_SECONDS`. As tentativas têm pausa longa e, depois do limite de falhas consecutivas, novos acessos são suspensos pelo período configurado.
 
 **Login e Turnstile**: o login verifica sessão existente antes de preencher o formulário. Quando há Cloudflare Turnstile, o bot clica no widget via CDP e aguarda o token antes de submeter. Em falhas de login, salva diagnóstico sanitizado em `LOGIN_DIAGNOSTICS_DIR`.
 
 **Parser de PDF com Camelot**: usa `flavor="stream"` (sem bordas de grade). A estrutura de colunas é detectada dinamicamente pelo cabeçalho de cada página, suportando qualquer combinação de colunas extras selecionadas no ERP. Linhas de sub-filial que aparecem entre os produtos são automaticamente ignoradas.
 
-**Estratégia de upsert**: a tabela `carla_produtos` não tem `UNIQUE` constraint em `descricao`, então o upsert usa tabela temporária de staging + CTE com `UPDATE` retornando as linhas atualizadas e `INSERT` somente nas não encontradas.
+**Estratégia de persistência**: `codigo_erp` é a chave única. Produto existente atualiza estoque em cada ciclo; preço só atualiza depois de 24 horas e dentro do limite de variação. Produto novo entra completo. Nome, marca e dimensões existentes não são sobrescritos pelo ciclo comum.
+
+**Quarentena de preço**: alterações acima de `PRICE_MAX_CHANGE_PERCENT` preservam o preço atual e são registradas em `carla_preco_divergencias`.
+
+O plano de implantação, rollback e critérios de aceite está em [docs/PLANO.md](docs/PLANO.md).
 
 **Código e nome da marca**: o ERP exporta a marca no formato `"{id} - {nome}"` (ex: `"3 - OCEANE"`). O parser extrai somente o nome (`"OCEANE"`) removendo o prefixo numérico.
 

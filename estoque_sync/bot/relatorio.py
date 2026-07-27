@@ -19,6 +19,7 @@ from app.logging_config import get_logger
 logger = get_logger("bot.relatorio")
 
 RELATORIO_URL = f"{settings.objetiva_url}/Relatorio/Estoque"
+MODELO_RELATORIO = "SALDO PRODUTO (A4 RETRATO)"
 
 # JS compartilhado: normaliza texto removendo acentos, espaços extras e uppercasing
 _JS_NORMALIZAR = """
@@ -288,8 +289,8 @@ async def gerar_e_baixar_relatorio(browser: Any) -> str:
 
     Fluxo:
     1. Navegar para /Relatorio/Estoque e aguardar #form-relatorio
-    2. Aba Principal: Filial (todas), Marca (todas), Modelo (A4 PAISAGEM), Tabela de Preço
-    3. Aba "Colunas à Imprimir": Coluna1=ALTURA, Coluna2=LARGURA, Coluna3=PESO
+    2. Aba Principal: Filial (todas), Marca (todas), Modelo (A4 RETRATO), Tabela de Preço
+    3. Aba "Colunas à Imprimir": colunas extras desativadas
     4. Clicar em "Visualizar" (#btnVisualizar)
     5. Aguardar download automático do PDF
 
@@ -331,16 +332,17 @@ async def gerar_e_baixar_relatorio(browser: Any) -> str:
         logger.info("configurando_marca")
         await _selecionar_todos_no_select_multi(page, "MarcasId")
 
-        # Modelo (#ModeloRelatorioId): texto_exato para evitar match com RETRATO
+        # Modelo (#ModeloRelatorioId): RETRATO reduz a largura da tabela e
+        # diminui sobreposições na extração do PDF.
         logger.info("configurando_modelo")
         if not await _selecionar_select_por_texto(
             page,
             "ModeloRelatorioId",
-            incluir=["PAISAGEM"],
-            excluir=["RETRATO"],
-            texto_exato="SALDO PRODUTO (A4 PAISAGEM)",
+            incluir=["RETRATO"],
+            excluir=["PAISAGEM"],
+            texto_exato=MODELO_RELATORIO,
         ):
-            raise RuntimeError("Modelo 'SALDO PRODUTO (A4 PAISAGEM)' não encontrado")
+            raise RuntimeError(f"Modelo '{MODELO_RELATORIO}' não encontrado")
 
         # Aguardar ERP processar onChange do Modelo (pode resetar TabelaPreco)
         await page.sleep(1)
@@ -360,7 +362,7 @@ async def gerar_e_baixar_relatorio(browser: Any) -> str:
             filial="TODAS",
             marca="TODAS",
             tabela_preco="1 - PADRAO",
-            modelo="SALDO PRODUTO (A4 PAISAGEM)",
+            modelo=MODELO_RELATORIO,
         )
 
         # -------------------------------------------------------
@@ -375,36 +377,18 @@ async def gerar_e_baixar_relatorio(browser: Any) -> str:
         await aba_colunas.click()
         await page.sleep(1)
 
-        # Coluna 1: ALTURA (value=25)
-        if not await _selecionar_select_por_texto(
-            page, "Coluna1", incluir=["ALTURA"], texto_exato="ALTURA"
-        ):
-            raise RuntimeError("Coluna1: opção 'ALTURA' não encontrada")
-
-        # Coluna 2: LARGURA (value=26)
-        if not await _selecionar_select_por_texto(
-            page, "Coluna2", incluir=["LARGURA"], texto_exato="LARGURA"
-        ):
-            raise RuntimeError("Coluna2: opção 'LARGURA' não encontrada")
-
-        # Coluna 3: PESO (value=23)
-        if not await _selecionar_select_por_texto(
-            page, "Coluna3", incluir=["PESO"], texto_exato="PESO"
-        ):
-            raise RuntimeError("Coluna3: opção 'PESO' não encontrada")
-
-        # Coluna 4: MARCA
-        if not await _selecionar_select_por_texto(
-            page, "Coluna4", incluir=["MARCA"], texto_exato="MARCA"
-        ):
-            raise RuntimeError("Coluna4: opção 'MARCA' não encontrada")
+        for data_id in ("Coluna1", "Coluna2", "Coluna3", "Coluna4"):
+            if not await _selecionar_select_por_texto(
+                page, data_id, incluir=["NENHUM"], texto_exato="NENHUM"
+            ):
+                raise RuntimeError(f"{data_id}: opção 'NENHUM' não encontrada")
 
         logger.info(
             "colunas_a_imprimir_configuradas",
-            coluna1="ALTURA",
-            coluna2="LARGURA",
-            coluna3="PESO",
-            coluna4="MARCA",
+            coluna1="NENHUM",
+            coluna2="NENHUM",
+            coluna3="NENHUM",
+            coluna4="NENHUM",
         )
 
         # -------------------------------------------------------
